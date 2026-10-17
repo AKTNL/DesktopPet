@@ -437,7 +437,8 @@ def test_v1_long_hints_fit_their_labels_at_compact_width(tmp_path, monkeypatch):
     """
     dialog, _cfg = _dialog(tmp_path, monkeypatch)
     try:
-        dialog.island_network_check.setChecked(True)  # 网络组的行依赖满足才参与布局
+        dialog.island_enabled_check.setChecked(True)
+        dialog.island_network_check.setChecked(True)  # 灵动岛及网络组的行依赖满足才参与布局
         dialog.resize(dialog.minimumSize())
         dialog.show()
         keys = ["drop_gravity", "network_probe_interval", "harness_autostart", "harness_launch_target"]
@@ -563,6 +564,8 @@ def test_v4_search_reports_the_hidden_dependency_without_changing_config(tmp_pat
     """依赖不满足：不改配置、给可见的依赖说明；前置开关打开后同一查询能找到并展开。"""
     dialog, cfg = _cfg_dialog(tmp_path, monkeypatch)
     try:
+        dialog.island_enabled_check.setChecked(True)
+        app.processEvents()
         assert cfg.get("island_network_enabled") is False
         row = _search(dialog, "探测间隔")
         assert row.objectName() == "settingRow_network_probe_interval"

@@ -21,6 +21,19 @@ import os
 import sys
 from pathlib import Path
 
+if sys.platform == "win32":
+    _sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    if os.path.isdir(_sys32):
+        try:
+            os.add_dll_directory(_sys32)
+        except (AttributeError, OSError):
+            pass
+        try:
+            import ctypes
+            ctypes.WinDLL(os.path.join(_sys32, "icuuc.dll"))
+        except Exception:
+            pass
+
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
