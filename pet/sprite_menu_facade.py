@@ -391,6 +391,13 @@ class SpriteMenuFacade:
         return lambda *_ignored: fn(host)
 
     @property
+    def on_open_balance_key(self):
+        """「配置 API Key」：``AppShell.open_balance_key_dialog``。"""
+        if not self._chat_enabled():
+            return None
+        return _first_callable(self._hosts(), ("open_balance_key_dialog",))
+
+    @property
     def on_show_weather(self):
         """「查看天气」：``AppShell.show_weather``；父窗同样是发起 sprite 的呈现器。
 

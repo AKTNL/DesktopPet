@@ -55,6 +55,7 @@
       "section": "tools",
       "children": [
         {"type": "action", "id": "balance", "visible": true},
+        {"type": "action", "id": "balance_key", "visible": true},
         {"type": "action", "id": "harness", "visible": true},
         {"type": "action", "id": "deepseek_web", "visible": true},
         {"type": "action", "id": "check_update", "visible": true},

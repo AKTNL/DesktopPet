@@ -265,6 +265,15 @@ def vector_menu_icon(menu: QMenu, name: str, size: int | None = None) -> QIcon:
         painter.drawEllipse(QPointF(8.0, 8.0), 6.0, 3.8)
         painter.drawEllipse(QPointF(8.0, 8.0), 1.5, 1.5)
         painter.drawLine(QPointF(2.5, 13.5), QPointF(13.5, 2.5))
+    elif name == "eye":
+        painter.drawEllipse(QPointF(8.0, 8.0), 6.0, 3.8)
+        painter.drawEllipse(QPointF(8.0, 8.0), 1.5, 1.5)
+    elif name == "key":
+        painter.drawEllipse(QPointF(5.5, 6.0), 3.5, 3.5)
+        painter.drawEllipse(QPointF(5.5, 6.0), 1.2, 1.2)
+        painter.drawLine(QPointF(8.0, 8.5), QPointF(13.5, 14.0))
+        painter.drawLine(QPointF(11.0, 11.5), QPointF(12.5, 10.0))
+        painter.drawLine(QPointF(12.5, 13.0), QPointF(14.0, 11.5))
     elif name == "balance":
         painter.drawEllipse(QPointF(8.0, 8.0), 6.0, 6.0)
         painter.drawLine(QPointF(5.0, 5.5), QPointF(11.0, 5.5))

@@ -21,7 +21,21 @@
    monkeypatch（test_agent_link / test_proactive 已如此）。
 """
 
+import os
 import sys
+
+if sys.platform == "win32":
+    _sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    if os.path.isdir(_sys32):
+        try:
+            os.add_dll_directory(_sys32)
+        except (AttributeError, OSError):
+            pass
+        try:
+            import ctypes
+            ctypes.WinDLL(os.path.join(_sys32, "icuuc.dll"))
+        except Exception:
+            pass
 
 import pytest
 

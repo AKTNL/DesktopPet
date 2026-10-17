@@ -79,6 +79,7 @@ REQUIRED_LABELS = (
     "大小",
     "DeepSeek Harness",
     "打开网页版 DeepSeek",
+    "配置 API Key",
     "主动识屏",
     "Agent 联动",
     "网络信息",
@@ -93,7 +94,7 @@ MUSIC_LABELS = (
     "打开网易云音乐给主人放歌",
     "打开QQ音乐给主人放歌",
 )
-CHAT_GATED_LABELS = ("AI 对话", "看看屏幕", "主动识屏", "DeepSeek 余额")
+CHAT_GATED_LABELS = ("AI 对话", "看看屏幕", "主动识屏", "DeepSeek 余额", "配置 API Key")
 # Windows 专有项：主动识屏 v1 依赖 win32 前台窗口/截屏能力（vision.py /
 # proactive.py 仅 win32 起监视器），菜单注册处 shared.add_proactive_menu 与
 # registry proactive_screen 均按 sys.platform == "win32" 门控——posix 上
@@ -129,6 +130,9 @@ class _StubAppShell:
 
     def open_network_info(self):
         self._record("open_network_info")
+
+    def open_balance_key_dialog(self):
+        self._record("open_balance_key_dialog")
 
     def trigger_voice_chime_now(self, text=""):
         self._record("trigger_voice_chime_now", text)
@@ -206,6 +210,7 @@ def _reference_window(config, *, chat=True):
     win.on_open_chat = (lambda: None) if chat else None
     win.on_open_chat_settings = (lambda: None) if chat else None
     win.on_show_balance = (lambda parent=None: None) if chat else None
+    win.on_open_balance_key = (lambda: None) if chat else None
     win.on_show_weather = lambda parent=None: None
     win.on_look_screen = win.look_at_screen if chat else None
     win.on_open_modern_settings = lambda: None

@@ -114,6 +114,10 @@ class _BalanceBridge(_BackgroundResult):
             return
         if not ok:
             self.win.show_bubble(str(payload), duration_ms=6000)
+            if "未配置 API Key" in str(payload) and self.owner is not None:
+                open_key = getattr(self.owner, "open_balance_key_dialog", None)
+                if callable(open_key):
+                    open_key()
             return
         _show_balance_payload(self.win, payload)
         if self.owner is not None and hasattr(self.owner, "_update_island_balance"):
@@ -611,6 +615,8 @@ class PetInstance:
         # 网络信息（issue #172）：右键菜单入口 → 进程级弹窗（overlay 侧由
         # SpriteMenuFacade.on_network_info 走同一方法）。
         win.on_network_info = self._slot_wrap(self.shell.open_network_info)
+        # 配置 API Key 弹窗（右键菜单入口及余额未配 Key 快捷路径）
+        win.on_open_balance_key = self._slot_wrap(self.shell.open_balance_key_dialog) if self.enable_chat else None
         win.on_voice_chime_now = self._slot_wrap(self.shell.trigger_voice_chime_now)
         win.on_toggle_voice_chime = self._slot_wrap(self.shell.toggle_voice_chime)
         # 点击自言自语的朗读走同一条音频通道（AppShell 持有，进程内唯一）。
@@ -1311,6 +1317,8 @@ class AppShell:
         # 网络信息弹窗（issue #172）：进程级单例、非模态。数据只在打开时取一次
         # （后台线程），故不需要常驻服务；窗口销毁即置空。
         self.network_info_dialog = None
+        # 配置 API Key 弹窗：进程级单例、非模态。
+        self.balance_key_dialog = None
         if self._todo_wanted():
             self._ensure_todo_service()
         # 语音报时：进程级单例（多窗共用调度器）。默认关闭（2026-09-19 起，
@@ -4330,6 +4338,36 @@ class AppShell:
         """
         if getattr(self, "network_info_dialog", None) is dialog:
             self.network_info_dialog = None
+
+    def open_balance_key_dialog(self) -> None:
+        """打开「配置 API Key」弹窗（非模态单例）。"""
+        from .balance_key_dialog import BalanceKeyDialog
+
+        dialog = getattr(self, "balance_key_dialog", None)
+        if dialog is not None and not shiboken6.isValid(dialog):
+            dialog = None
+            self.balance_key_dialog = None
+        if dialog is None:
+            parent = self.win
+            dialog = BalanceKeyDialog(self, parent if isinstance(parent, QWidget) else None)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            dialog.finished.connect(self._balance_key_finished)
+            dialog.destroyed.connect(
+                lambda *_args, owner=self, target=dialog:
+                    owner._balance_key_destroyed(target))
+            self.balance_key_dialog = dialog
+        inst = self.instance
+        if inst is not None:
+            inst._present_dialog(dialog)
+        else:
+            dialog.show()
+
+    def _balance_key_finished(self, _result: int) -> None:
+        self.balance_key_dialog = None
+
+    def _balance_key_destroyed(self, dialog) -> None:
+        if getattr(self, "balance_key_dialog", None) is dialog:
+            self.balance_key_dialog = None
 
     def trigger_voice_chime_now(self, text: str = "") -> None:
         """手动报时：设置页试听入口与菜单编排加回的「立即报时」共用（该菜单项默认隐藏）。

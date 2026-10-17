@@ -390,6 +390,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self.on_open_quick_chat = None
         self.on_open_chat_settings = None
         self.on_show_balance = None
+        self.on_open_balance_key = None
         self.on_show_weather = None
         self.on_check_update = None
         self.on_look_synced = None

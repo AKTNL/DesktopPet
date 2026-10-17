@@ -1051,3 +1051,21 @@ def test_service_presenter_respects_the_per_sprite_bubble_gate(tmp_path, monkeyp
         assert calls == [second]
     finally:
         toggle._teardown(shell)
+
+
+def test_facade_on_open_balance_key(tmp_path):
+    from tests import test_overlay_collision_toggle as toggle
+
+    shell, cfg = toggle._make_slot_shell(tmp_path)
+    try:
+        shell.open_balance_key_dialog = lambda: "dialog_opened"
+        facade = SpriteMenuFacade(shell)
+        assert callable(facade.on_open_balance_key)
+        assert facade.on_open_balance_key() == "dialog_opened"
+
+        # 聊天未开启时返回 None
+        facade._chat_enabled = lambda: False
+        assert facade.on_open_balance_key is None
+    finally:
+        toggle._teardown(shell)
+

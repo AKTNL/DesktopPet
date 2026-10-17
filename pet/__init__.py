@@ -11,6 +11,11 @@ if sys.platform == "win32":
             os.add_dll_directory(_sys32)
         except (AttributeError, OSError):
             pass
+        try:
+            import ctypes
+            ctypes.WinDLL(os.path.join(_sys32, "icuuc.dll"))
+        except Exception:
+            pass
 
 # 版本号唯一来源：updater（更新检测基准）与安装包版本均从这里读取。
 __version__ = '4.3.1'
