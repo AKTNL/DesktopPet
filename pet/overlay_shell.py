@@ -1,0 +1,7175 @@
+# -*- coding: utf-8 -*-
+"""Phase 4.1a 产品壳：overlay 拓扑（合成窗）的 AppShell 挂载层。
+
+设计稿：.scratch/single-overlay-window/PHASE4_DESIGN.md（T1/T4/T5 + §5 4.1a 行
++ v1.1 §10 屏热插拔/会话事件升级项）。本模块只做骨架与生命周期：
+
+- 每块**被占用的**屏一张 OverlayWindow（1 主 + 0..N 副），各自带该屏的
+  sprite 成员表；主 sprite 与子 sprite 都在**它自己那块屏**的窗里
+  （``screen_host.ScreenHost`` 持有屏可用区与那一屏自己的控制器组）；
+- **每屏一份**三控制器（BehaviorController/SpriteCollisionWorld/
+  ThrowPhysicsController，都是屏局部坐标/局部分量），由**统一 tick 驱动器**
+  （tick_driver.TickDriver，M-2/T2）在同一个 QTimer 里按宿主分组推进：不同屏的
+  局部坐标绝不进同一个世界（同局部坐标的两只宠在真机上相距一整块屏）；overlay
+  只负责 advance+paint/脏矩形。像素坐标是 overlay 局部坐标（= 全局 - 屏原点）；
+- 进程级共享面仍只有一份：壳、驱动器时钟、音效池、联动/主动搭话、托盘、监视器、
+  配置文件；``self.overlay`` / ``_bounds`` / 三控制器是**主宿主**的视图（见
+  ``_main_host``），任何"整组"动作都遍历 ``shell.hosts()``；
+- 屏事件：screenAdded/screenRemoved/primaryScreenChanged/geometryChanged →
+  宿主创建/跨屏移交/逐屏几何同步，sprite 位置按 rx/ry（中心相对**它那块屏**可用区
+  的比例）语义迁移；屏 DPR 变化重喂该屏 sprite.set_dpr；拖拽中拔屏先收尾拖拽再迁移；
+- 跨屏是**可关闭的全局偏好**（主配置 ``allow_cross_screen``，默认关、进程快照）：
+  关着时只有启动时那块屏有窗、跨屏路由一律拒绝（拖不过去）；**屏归属**（档案的
+  ``screen_name``）只在有意换屏时写（``_remember_sprite_screen``），位置自存
+  （``_save_child_geometry``）只写比例与朝向——于是关掉跨屏、或原来那块屏临时
+  不在线，都不会改写用户摆好的多屏归属，重新开启并重启即回到各自那块屏；
+- 会话结束（Windows 关机/注销）：复用 session_watcher 的闸门与信号链，
+  收口本路径 MovieLibrary 的全部 clip（issue #111 等价链，D10 落点）。
+
+T5 切换策略：PET_RENDER_TOPOLOGY=overlay 环境变量是开发期一次性分流 flag，
+读取收口在本模块 is_overlay_topology()；T4 Phase A 起判定再叠加主配置的
+``stream_capture_mode``（勾选「直播捕获兼容」= 重启级切到 legacy 单窗，OBS 才
+枚举得到窗口；见 ``overlay_settings_command``）。
+4.1a 明确不做：多 sprite（4.2）、位置持久化（4.2a，本刀恒走默认右下角）、
+岛/气泡/聊天/菜单全量 parity（4.1b/4.1c）、捕获模式切换（T4 后续）。
+
+4.2b（本刀后段）：多 sprite 生命周期按 D5/D6 落地——spawn 分配 slot 身份并写
+活跃宠清单（``overlay-active-pets.json``，运行时状态文件）；退出即出清单
+（slot 配置保留）；重启按v2清单恢复（含各自角色与几何），slot0可空且永不提升。
+身份/档案存储在pet_profiles，overlay_spawn_state仅兼容包装。
+
+4.2c 后段（本刀）：托盘聚合（单托盘 + 逐只子菜单，对齐 app.py:3267-3301 的
+单托盘多窗语义）、D12「退出子肥鱼」指令通道消费（独立设置进程写指令文件 →
+本壳经 config 目录 watcher + 轮询消费，纯逻辑在 ``overlay_settings_command``）、
+D13 逐 sprite 设置路由（菜单按被点 sprite 的 config 身份传 ``--instance``）。
+
+4.3 后半（本刀）：把本壳做成进程级共享子系统（agent_link / proactive /
+全屏 watcher）的**呈现扇出目标**——overlay 拓扑下 ``instances[].win`` 恒为
+None，扇出集合为空等于联动/自说自话静默缺失（D0 的另一半，见
+``multi_window_shared.presentation_targets``）。本类因此补齐 PetWindow 的
+呈现等价面：
+
+- 气泡：``show_bubble`` / ``hold_bubble`` / ``hide_bubble`` 落主 sprite 头顶
+  （``SpriteBubbleFollower.show``）；提醒队列 ``show_alert`` / ``resolve_alert``
+  / ``clear_alerts`` 直接复用 ``window_alerts`` 的 host 形函数（同一份队列
+  语义，不重复造）；飞行期（``_flying_sprites``）气泡整体禁掉——统一门禁
+  ``_bubble_blocked(sprite)``，飞的那只禁泡、其余宠照常（见
+  ``_on_sprite_flight_changed``）；
+- 聚合状态：``isVisible`` / ``_dragging`` / ``_physics_mode`` /
+  ``_click_effect_phase`` / ``mouse_through`` / ``_bubble_busy_until`` /
+  ``_bubble_suppressed``（proactive G1 守卫与联动节流门读的就是这些；
+  ``_bubble_suppressed`` **不含**飞行态——它同时是联动节流位）；
+- 联动动作：``request_link_anim`` / ``request_link_idle`` / ``switch_clip`` /
+  ``cats`` / ``idles`` 映射到 ``BehaviorController``；
+- 显隐：``set_pet_visible`` 同步 pause/resume proactive 与 agent_link
+  （``window.py:1214-1250`` 语义；共享实例的 pause/resume 是 no-op，见
+  multi_window_shared 的说明——G1 逐 tick 读可见性）；
+- 快速对话：气泡可点 → ``open_quick_chat``，``QuickChatBubble`` 锚定被点
+  sprite（``_SpriteChatAnchor`` 提供 pet 形的 ``visible_content_rect`` /
+  ``on_open_chat``），回车发送走既有 ChatService/SessionStore 链路；
+  无聊天打包变体（``pet.chat`` 被排除）按 app.py 既有 ImportError 守卫
+  静默降级为不可点。
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+import math
+import queue
+import threading
+import time
+import weakref
+from collections import deque
+from pathlib import Path
+
+import shiboken6
+from PySide6.QtCore import (
+    QEvent, QObject, QPoint, QPointF, QRect, QRectF, QTimer, Qt, Signal)
+from PySide6.QtGui import QBitmap, QGuiApplication, QIcon, QImage, QPixmap, QRegion
+from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
+
+from . import autostart as autostart_mod
+from . import catalog
+from . import click_sound
+from . import overlay_settings_command
+from . import overlay_spawn_state
+from . import slot_manager
+from . import window_alerts
+from .context_menus.shared import (
+    add_tray_action,
+    animation_icon_cache_drop_library,
+    release_menu_tree,
+)
+from .physics import throw_speed_cap
+from .config import (
+    DEFAULT_SELF_TALK_BUBBLE_STYLE,
+    DEFAULT_SELF_TALK_DURATION_SECONDS,
+    DEFAULT_SELF_TALK_MAX_INTERVAL,
+    DEFAULT_SELF_TALK_MIN_INTERVAL,
+)
+from .fun_image_popup import oijingjing_image_path, resolve_fun_asset
+from .overlay_peripherals import FullscreenCursorWatcher
+from .overlay_window import OverlayWindow
+from .pet_sprite import INTERACTION_DRAG, INTERACTION_THROWN, PetSprite
+from .screen_host import ScreenHost
+from .session_watcher import install_session_watcher
+from .speech_bubble import (
+    SELF_TALK_IMAGE_BOX_H,
+    SELF_TALK_IMAGE_BOX_W,
+    list_self_talk_images,
+)
+from .sprite_behavior import (
+    STATE_ACTS,
+    STATE_CLICK,
+    STATE_IDLE,
+    STATE_MOVE,
+)
+from .sprite_bubble import SpriteBubbleFollower, sprite_anchor_rect_global
+from .sprite_sound import SpriteSoundPlayer
+from .tick_driver import TickDriver
+
+ENV_TOPOLOGY = overlay_settings_command.ENV_TOPOLOGY
+TOPOLOGY_OVERLAY = overlay_settings_command.TOPOLOGY_OVERLAY
+
+# 联动动作链里「一次性动作正在播」（window.py _is_one_shot_playing 的 sprite 等价物）：
+# 动作池 / 点击回应 / 移动三类都不可被打断，联动请求排进待播槽。
+_LINK_ONESHOT_STATES = (STATE_ACTS, STATE_CLICK, STATE_MOVE)
+
+# 托盘首帧取图轮询：sprite 侧没有 legacy 的 ``frame_ready`` 信号，只能用短轮询。
+# 预算内 500ms（首帧通常几百毫秒内到），超预算降频到 5s **继续等**——首帧晚于
+# 预算（首跑帧序列转码/慢启动/内存压力）时必须还能自愈，绝不永久停在占位图标。
+_TRAY_ICON_POLL_MS = 500
+_TRAY_ICON_POLL_BUDGET = 20
+_TRAY_ICON_SLOW_POLL_MS = 5000
+
+# 自言自语配图解码缓存的安全余量：气泡出图按显示盒等比适配，呼吸气泡的图像
+# 安全区（``speech_bubble._breath_size_for_content``）在窄配图大小下会比标准盒
+# 略宽（≤ 气泡宽 ×0.7，气泡宽 ≤ 显示盒长边 + 一点），1.1 覆盖这点溢出；同时也
+# 吸收 Qt 把逻辑矩形映射到设备像素时的取整。超出部分本来就会被 Smooth
+# 缩放掉，不追求精确贴合。
+_SELF_TALK_IMAGE_CACHE_SLACK = 1.1
+
+
+def self_talk_image_cache_edge(image_scale: float, dpr: float = 1.0) -> int:
+    """自言自语配图解码缓存的目标长边（像素）＝显示盒长边 × 配图大小 × DPR × 余量。
+
+    旧实现把每张图固定缩到长边 ≤640：用户 ``self_talk_image_scale=146``、DPR=1
+    时实际只画 ~321×204（``speech_bubble.SELF_TALK_IMAGE_BOX_*`` × scale），
+    多出来的像素纯占内存（实机 24 张 36.8MB）。改成按现算的显示盒定目标后，
+    同一批素材降到 ~1/3；2× 屏（DPR=2）则按物理像素放大到 2 倍——够锐利、
+    又不为没画的尺寸付内存。
+
+    两个入参都钳位（配图大小 0.5..3.0，与 ``speech_bubble.show_image`` 同口径；
+    DPR ≥ 1，读不到 DPR 时不按"更省内存"裁掉物理像素）。
+    """
+    scale = max(0.5, min(3.0, float(image_scale)))
+    ratio = max(1.0, float(dpr))
+    box = max(SELF_TALK_IMAGE_BOX_W, SELF_TALK_IMAGE_BOX_H) * scale * ratio
+    # 取整前扣掉浮点噪声：220×1.1 在二进制下是 242.00000000000003，直接 ceil
+    # 会凭空多要一整像素（内存上无所谓，但边界语义要稳、断言要能复现）。
+    return int(math.ceil(box * _SELF_TALK_IMAGE_CACHE_SLACK - 1e-6))
+
+
+def _resolve_self_talk_image_dir(raw: str) -> str:
+    """解析自言自语配图目录（语义逐行对齐 ``window.py:123``）。
+
+    为什么不直接 import 那个私有函数：overlay 拓扑不构造 PetWindow，壳不该
+    为了一个 8 行路径换算去依赖 ``pet.window`` 的私有面；这里按源实现的语义
+    逐行镜像，行为差异一眼可查。用户显式配置的外部目录被删除后不再回退内置
+    彩蛋池（用户删目录的意图就是"不要再看图"），相对路径（内置 assets）保留
+    回退以兼容便携包目录迁移。
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute() and not candidate.is_dir():
+        return ""
+    return str(resolve_fun_asset(raw, oijingjing_image_path().parent))
+
+
+def _import_quick_chat():
+    """取 ``QuickChatBubble``；无聊天打包变体返回 None（app.py 既有守卫惯例）。
+
+    打包变体以 ``excludes=['pet.chat']`` 排除聊天模块（见 ``pet/__main__.py
+    _chat_available``），此时 ``pet.quick_chat`` 的模块级 ``from .chat.service
+    import ChatService`` 抛 ImportError。只吞 ``pet.chat`` 系的 ImportError
+    （返回 None = 无聊天变体）；其它导入错误照旧抛出，由壳层统一降级并落
+    日志，不在这里静默吞掉（不掩盖真实故障）。
+    """
+    try:
+        from .quick_chat import QuickChatBubble
+    except ImportError as exc:
+        if str(getattr(exc, "name", "") or "").startswith("pet.chat"):
+            return None
+        raise
+    return QuickChatBubble
+
+
+class _SpriteChatAnchor:
+    """快速对话气泡的 pet 形锚点（``QuickChatBubble.position_near_pet`` 只读两面）。
+
+    ``quick_chat.py`` 只用 ``visible_content_rect()`` 定位（242-285）与
+    ``on_open_chat`` 打开完整聊天窗（445-450），不需要 PetWindow 的其余面；
+    每个 sprite 一个锚点，被点中的是哪一只就锚在哪一只头顶。
+    """
+
+    __slots__ = ("_shell", "_sprite")
+
+    def __init__(self, shell, sprite) -> None:
+        self._shell = shell
+        self._sprite = sprite
+
+    def presentation_valid(self) -> bool:
+        return self._sprite is not None and self._sprite in self._shell._all_sprites()
+
+    def visible_content_rect(self) -> QRect:
+        """身体框全局矩形（气泡锚点，口径同 SpriteBubbleFollower.anchor）。"""
+        if not self.presentation_valid():
+            return QRect()
+        overlay = getattr(self._shell, "overlay", None)
+        if overlay is None:
+            return QRect()
+        return sprite_anchor_rect_global(self._sprite, overlay.geometry().topLeft())
+
+    def on_open_chat(self) -> None:
+        """气泡内「完整聊天窗」入口（QuickChatBubble._open_full_chat 调用面）。"""
+        self._shell.open_full_chat()
+
+
+class _GoldenSpinSpriteHost:
+    """``GoldenSpinController`` 的 sprite 宿主：``update()`` = 把当前角度写进 sprite。
+
+    旧路径由 ``PetWindow.paintEvent`` 读 ``current_angle_deg()`` 应用旋转
+    （window_effects.begin/end_rotation）；sprite 世界的绘制入口是
+    ``PetSprite.set_throw_rotation``，故控制器每次 ``win.update()`` 都等价地
+    写一次角度（0 = 回正）。目标 sprite 由 ``shell._golden_spin_target`` 指定
+    ——多宠时点击哪只转哪只（旧架构一窗一宠，天然只有一只）。
+
+    **控制器全壳共享、目标独占**（R06）：角度只写给 ``_golden_spin_target``
+    指向的那一只，换目标由 ``shell._ensure_golden_spin`` 先把旧目标回正并脱离
+    （见 ``_settle_golden_spin_target``）——``_golden_spin_target`` 为 None 时
+    本方法整拍空转，这正是结清过程中"不再往旧目标写角"的闸门。
+    """
+
+    __slots__ = ("_shell",)
+
+    def __init__(self, shell) -> None:
+        self._shell = shell
+
+    def update(self) -> None:
+        shell = self._shell
+        spin = getattr(shell, "_golden_spin", None)
+        sprite = getattr(shell, "_golden_spin_target", None)
+        if spin is None or sprite is None:
+            return
+        apply = getattr(sprite, "set_throw_rotation", None)
+        if callable(apply):
+            apply(float(spin.current_angle_deg()))
+
+
+class _MusicSingChain:
+    """音乐唱歌续播（``window.py:2473-2481 _on_anim_ended`` 的 sprite 等价物）。
+
+    sprite 行为控制器没有动画结束回调面（``sprite_behavior`` 的收口在 tick），
+    改由驱动器 extras 每 tick 观测：唱歌 clip 自然播完回待机链时，只要音乐
+    还在放就立即无缝重播（旧机 ``_music_sing_enabled and _music_sing_active``
+    分支，不再每次查音频 COM）。用户点击/拖拽/掷骰接管唱歌时不再续播
+    （旧机点击动画结束没有唱歌分支，同款语义）。
+    """
+
+    def __init__(self, shell) -> None:
+        self._shell = shell
+        self._was_singing = False
+
+    def tick(self, sprites, dt: float) -> None:
+        shell = self._shell
+        sprite = getattr(shell, "sprite", None)
+        behavior = getattr(shell, "behavior", None)
+        if sprite is None or behavior is None:
+            return
+        if not bool(getattr(shell, "_music_sing_active", False)):
+            self._was_singing = False
+            return
+        state = behavior.state_of(sprite)
+        if state == STATE_ACTS and behavior.anim_of(sprite) == _sing_anim():
+            self._was_singing = True
+            return
+        if self._was_singing and state == STATE_IDLE:
+            # 唱歌 clip 播完 → 音乐仍在放则续播（同一 clip，首帧必热）
+            self._was_singing = False
+            shell.switch_clip(_sing_anim())
+            return
+        self._was_singing = False
+
+
+def _sing_anim() -> str:
+    """唱歌动画名（与旧架构同源常量，杜绝第二套字符串）。
+
+    惰性 import：``window_alerts.check_music_sing`` 本身就有
+    ``from .window import SING_ANIM``（共享实现的既定依赖），这里沿用同一
+    依赖面；只在功能真的启用（``_music_sing_active``）时才会被调用，未开启
+    该设置的普通 overlay 进程不多付一次 pet.window 导入。
+    """
+    from .window import SING_ANIM
+    return SING_ANIM
+
+
+class _LinkAnimChain:
+    """联动动作链接续（``window.py _on_anim_ended`` → ``_link_next_provider`` 等价物）。
+
+    PetWindow 靠动画结束回调接续联动动作；sprite 世界的行为控制器没有结束
+    回调面（``sprite_behavior`` 不在本刀范围），改由驱动器 extras 每 tick
+    观测「一次性动作结束」的下降边沿，等价地接续待播动作/下一个联动动作。
+    零新线程、每 tick 一次 ``state_of`` 查询（字典取值）。
+    """
+
+    def __init__(self, shell) -> None:
+        self._shell = shell
+        self._was_busy = False
+
+    def tick(self, sprites, dt: float) -> None:
+        shell = self._shell
+        busy = shell._link_anim_busy()
+        was_busy, self._was_busy = self._was_busy, busy
+        if busy or not was_busy:
+            return
+        # 一次性状态（动作/点击/移动）刚播完：黄金回旋 armed 模式在此接续
+        # （旧机 _on_anim_ended → _effects_on_click_anim_finished，window.py:2533-2537）
+        shell._on_click_anim_finished()
+        # 待播优先，否则向 provider 要下一个
+        # （顺序同 legacy _on_anim_ended：先消费待播，再问联动链）
+        if shell._pending_link_anim:
+            shell._play_pending_link_anim()
+            return
+        provider = shell._link_next_provider
+        if not callable(provider):
+            return
+        try:
+            nxt = provider()
+        except Exception:
+            logging.debug("overlay: 联动动作链取下一个动作失败", exc_info=True)
+            return
+        if nxt:
+            shell.request_link_anim(str(nxt))
+
+
+# ---------------------------------------------------------------- B7b：per-slot 取源
+#
+# 旧架构：每只桌宠是**独立进程**，各读自己的 ``config-slot-N.json``
+# （``Config(instance_id="slot-N")`` + ``window.py`` 逐键读 ``self.cfg``），
+# 所有 sprite 级设置天然各存各的。单进程壳只有一份 ``self._config``，本组常量
+# 与视图类把那条身份→配置的对应关系复原：
+#
+# - 主 sprite → 本进程主配置；
+# - 子 sprite → 它自己的档案快照，缺文件/缺键取 Config 同源默认；
+# - 窗口级键（``on_top`` / ``mouse_through`` / ``pet_opacity`` / …）不在此列：
+#   一次只有一个合成窗，这些键物理上无法 per-pet（审计 C4），继续按主配置
+#   **全局**生效。
+#
+# 键集本体在 ``overlay_spawn_state.PER_SLOT_SETTING_KEYS``（零 Qt 轻模块，取舍与
+# 全量注释见该处）：独立设置进程也要按同一份键集分流，而它禁止导入本模块。
+PER_SLOT_SETTING_KEYS = overlay_spawn_state.PER_SLOT_SETTING_KEYS
+
+
+def _clamped_float(raw, default: float, low: float, high: float) -> float:
+    """读一个带上下限的浮点值；缺值/坏值回退 ``default``（再夹取）。
+
+    slot 文件可能被手工改坏（旧 Config 会清洗，这里只读不清洗），故每个 per-slot
+    数值键都要走这一层——异常/NaN 不能掀掉配置同步链。
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = float(default)
+    if value != value:  # NaN
+        value = float(default)
+    return max(low, min(high, value))
+
+
+class _SpriteConfig:
+    """子宠档案的清洗快照；generation 与原值在同一把目录锁内捕获。"""
+
+    def __init__(self, shell, sprite, *, snapshot=None, data=None) -> None:
+        from . import pet_profiles
+        from .config import normalize_pet_profile_snapshot
+
+        self._shell = shell
+        self._sprite = sprite
+        slot = 0 if sprite is getattr(shell, "sprite", None) else shell._spawned_slots.get(sprite)
+        config_dir = shell._spawn_config_dir()
+        if snapshot is None and slot is not None and config_dir:
+            snapshot = pet_profiles.read_slot_snapshot(config_dir, slot)
+        self.generation = snapshot.generation if snapshot is not None else None
+        self.status = snapshot.status if snapshot is not None else "memory"
+        if data is None:
+            if snapshot is not None and snapshot.profile is not None:
+                data = dict(snapshot.profile.data)
+            elif not config_dir:
+                data = dict(getattr(shell, "_slot_memory", {}).get(slot, {}))
+            else:
+                data = {}
+        self._slot_data = dict(data)
+        raw = {"version": 4, **data} if snapshot is None and not config_dir else data
+        self._values = normalize_pet_profile_snapshot(raw)
+
+    def get(self, key, default=None):
+        if key in self._values:
+            return self._values[key]
+        return self._shell._config.get(key, default)
+
+    def __getattr__(self, name):
+        return getattr(self._shell._config, name)
+
+
+class _SpritePetHost:
+    """被点 sprite 的 pet 形宿主（余额/识屏等 host 形消费方的 per-sprite 落点）。
+
+    ``_show_balance_payload`` / ``window_alerts`` 这类消费方按 PetWindow 面取值
+    （``show_bubble`` / ``cfg`` / ``isVisible``），旧架构每窗各有一个这样的宿主，
+    所以"点小肥鱼 → 气泡出现在小肥鱼头顶"。这里给子 sprite 一只最小宿主，主
+    sprite 仍直接用壳本身（行为与历史逐点一致）。
+
+    刻意不暴露 ``request_link_anim``：联动动作链的落点是主 sprite 的行为控制器，
+    子宠没有等价面（``_show_balance_payload`` 对该属性本就有 hasattr 守卫）。
+    """
+
+    def __init__(self, shell, sprite) -> None:
+        self._shell = shell
+        self._sprite = sprite
+
+    @property
+    def cfg(self):
+        return self._shell._sprite_config(self._sprite)
+
+    @property
+    def scale(self) -> float:
+        return float(getattr(self._sprite, "scale", 1.0) or 1.0)
+
+    def isVisible(self) -> bool:  # noqa: N802 (Qt/PetWindow 命名)
+        return self._shell._sprite_speech_visible(self._sprite)
+
+    def _sprite_in_flight(self, sprite=None) -> bool:
+        """这一只是否正在飞行（宿主面：默认就是本宿主绑定的 sprite）。"""
+        return self._shell._sprite_in_flight(
+            self._sprite if sprite is None else sprite)
+
+    def _bubble_blocked(self, sprite=None) -> bool:
+        """本 sprite 的气泡门禁（设置页抑制期或这一只正在飞行）。"""
+        return self._shell._bubble_blocked(
+            self._sprite if sprite is None else sprite)
+
+    def visible_content_rect(self) -> QRect:
+        overlay = getattr(self._shell, "overlay", None)
+        if overlay is None:
+            return QRect()
+        return sprite_anchor_rect_global(self._sprite, overlay.geometry().topLeft())
+
+    def show_bubble(self, text: str, duration_ms: int = 3200, **_kwargs) -> bool:
+        if self._bubble_blocked():
+            return False  # 飞行期不弹（飞的那只禁泡，见 OverlayShell._bubble_blocked）
+        return self._shell._show_bubble_text_for(
+            self._sprite, str(text), int(duration_ms), **_kwargs)
+
+    def hold_bubble(self, seconds: float) -> None:
+        self._shell.hold_bubble(seconds)
+
+    def hide_bubble(self) -> None:
+        self._shell._hide_bubble_for_sprite(self._sprite)
+
+
+class _SpriteServicePresenter(_SpritePetHost):
+    """手动服务结果（余额 / 天气）的**代次呈现器**（2026-10-10 终审 A10）。
+
+    菜单旁路此前把整个壳交给 ``AppShell.show_balance`` / ``AppShell.show_weather``，
+    落点由壳的 ``alert_target_sprite()``（= 最小可见槽）在结果到达时**动态决定**：
+    右击子肥鱼查天气，气泡冒在主肥鱼头上；请求在飞时把发起的那一只关掉，结果还会
+    落到别宠身上。点击路径（``_on_sprite_click`` → ``_sprite_host(target)``）早就按
+    发起 sprite 收口了，同一个意图在菜单旁路没有收口。
+
+    与 ``_SpritePetHost`` 的两处差别（其余宿主面逐字沿用）：
+
+    - **主 sprite 也带身份**：``show_bubble`` 走壳自己的完整门（提醒让路 / sticky /
+      飞行期），不是"当前最小的可见槽"；子 sprite 走 ``_show_bubble_text_for``。
+    - ``presentation_available()``：这只宠**还在不在**。判据是对象身份（同一槽重建
+      出来的是另一只宠 ⇒ 旧结果不许投给新住客，比"槽号 + 代次"更强），再叠整窗可见
+      与这只自己的可见性。关闭/隐藏后迟到的结果**只取消这一次呈现**：不清全局数据
+      缓存、不改别宠状态、不另找落点（规范 §一「关闭后的迟到结果」）。
+    """
+
+    def presentation_available(self) -> bool:
+        return bool(self._shell._sprite_speech_visible(self._sprite))
+
+    def show_bubble(self, text, duration_ms=3200, **kwargs) -> bool:
+        if not self.presentation_available():
+            return False
+        if self._bubble_blocked(self._sprite):
+            # 与 ``_SpritePetHost.show_bubble`` 同一道 per-sprite 门禁（设置页抑制期 /
+            # 这一只正在飞行）：override 只查 ``presentation_available`` 会漏掉它——
+            # 飞行中或被抑制的子宠照样冒泡（2026-10-10 终审 F04）。主 sprite 那一侧
+            # 壳的 ``show_bubble`` 自己也会查一次（``_bubble_blocked()``），两条路同门。
+            return False
+        if self._sprite is self._shell.sprite:
+            return bool(self._shell.show_bubble(text, int(duration_ms), **kwargs))
+        return bool(self._shell._show_bubble_text_for(
+            self._sprite, str(text), int(duration_ms), **kwargs))
+
+    def request_link_anim(self, name: str) -> None:
+        """余额档位动画的落点（仅主 sprite 有等价链）。
+
+        子 sprite 没有联动动作控制器，静默跳过——把动画播在主肥鱼身上等于"点了子肥鱼
+        却让主肥鱼转圈"，比不播更不像话。消费方（``_show_balance_payload``）本就对该
+        属性有 ``hasattr`` 守卫，不缺这条也能跑。
+        """
+        if self._sprite is not self._shell.sprite:
+            return
+        fn = getattr(self._shell, "request_link_anim", None)
+        if callable(fn):
+            fn(name)
+
+
+class _SpriteSelfTalkHost:
+    """一只**子** sprite 的自言自语宿主（``window_alerts`` host 形函数的适配面）。
+
+    旧架构每只宠各自计时、各自冒泡（``window.py:458-480`` + ``:740``）；主 sprite
+    在单进程壳里仍走壳自身的自言自语机（``OverlayShell._self_talk_*``，历史行为
+    逐点不变），本类只服务子 sprite：各自一份配置快照、各自一个**单发**定时器
+    （不新增常驻高频表——每次冒泡后重排下一次，与旧版同构）。
+    """
+
+    def __init__(self, shell, sprite) -> None:
+        self._shell = shell
+        self._sprite = sprite
+        # 属性名必须叫 ``_self_talk_timer``：``window_alerts`` 的 host 形函数
+        # 直接读写它（``schedule_self_talk`` 停表 + 起表）。
+        self._self_talk_timer = QTimer(shell)
+        self._self_talk_timer.setSingleShot(True)
+        self._self_talk_timer.timeout.connect(self._on_timeout)
+        self._last_self_talk_text: str | None = None
+        self._self_talk_images_checked_at = 0.0
+        self.reload()
+
+    # ---------------------------------------------------------------- 配置面
+    @property
+    def cfg(self):
+        return self._shell._sprite_config(self._sprite)
+
+    @property
+    def on_self_talk_speak(self):
+        """朗读通道（与主宠共用同一条：旧架构都是 ``win.on_self_talk_speak``）。"""
+        return getattr(self._shell, "on_self_talk_speak", None)
+
+    # ``window_alerts`` 的 host 形函数直接读这些私有属性（同 PetWindow 口径）
+    @property
+    def _bubble_suppressed(self) -> bool:
+        return bool(getattr(self._shell, "_bubble_suppressed", False))
+
+    def _sprite_in_flight(self, sprite=None) -> bool:
+        """这一只是否正在飞行（宿主面：默认就是本宿主绑定的 sprite）。"""
+        return self._shell._sprite_in_flight(
+            self._sprite if sprite is None else sprite)
+
+    def _bubble_blocked(self, sprite=None) -> bool:
+        """本 sprite 的气泡门禁（设置页抑制期或这一只正在飞行）。"""
+        return self._shell._bubble_blocked(
+            self._sprite if sprite is None else sprite)
+
+    @property
+    def _sticky_bubble_active(self) -> bool:
+        return bool(getattr(self._shell, "_sticky_bubble_active", False))
+
+    @property
+    def _alert_current(self):
+        return getattr(self._shell, "_alert_current", None)
+
+    @property
+    def _bubble_busy_until(self) -> float:
+        return float(getattr(self._shell, "_bubble_busy_until", 0.0))
+
+    def isVisible(self) -> bool:  # noqa: N802 (Qt/PetWindow 命名)
+        return self._shell._sprite_speech_visible(self._sprite)
+
+    def reload(self) -> None:
+        """（重）读该 sprite 自己那份 self_talk 配置（配置同步边界调用）。"""
+        cfg = self.cfg
+        self._self_talk_enabled = bool(cfg.get("self_talk_enabled", False))
+        self._self_talk_texts = window_alerts.read_self_talk_texts(
+            cfg.get("self_talk_texts"))
+        self._self_talk_duration_seconds = _clamped_float(
+            cfg.get("self_talk_duration_seconds"),
+            DEFAULT_SELF_TALK_DURATION_SECONDS, 1.0, 300.0)
+        self._self_talk_image_dir = str(cfg.get("self_talk_image_dir", "") or "")
+        self._self_talk_images = list_self_talk_images(
+            _resolve_self_talk_image_dir(self._self_talk_image_dir))
+        self._self_talk_image_scale = _clamped_float(
+            cfg.get("self_talk_image_scale"), 100, 50.0, 300.0) / 100.0
+        self._self_talk_min_interval = max(5.0, _clamped_float(
+            cfg.get("self_talk_min_interval"),
+            DEFAULT_SELF_TALK_MIN_INTERVAL, 0.0, 86400.0))
+        self._self_talk_max_interval = max(self._self_talk_min_interval, _clamped_float(
+            cfg.get("self_talk_max_interval"),
+            DEFAULT_SELF_TALK_MAX_INTERVAL, 0.0, 86400.0))
+        self._self_talk_images_checked_at = time.monotonic()
+        # 配图 decode 走壳共享的路径→QImage 缓存 + 后台预热线程（各 sprite 的
+        # 图片清单不同，缓存按绝对路径天然不串号）；**不动**壳的代次计数器，
+        # 免得 spawn 一只子宠就把主宠在飞的解码作废。
+        self._shell._warm_shared_self_talk_images(
+            [str(path) for path in self._self_talk_images])
+
+    # ---------------------------------------------------------------- 调度/冒泡
+    def schedule(self, *, after_display: bool = False) -> None:
+        window_alerts.schedule_self_talk(self, after_display=after_display)
+
+    def _schedule_self_talk(self, *, after_display: bool = False) -> None:
+        """host 形别名（``window_alerts.on_self_talk_timeout`` 读这个私有名）。"""
+        self.schedule(after_display=after_display)
+
+    def stop(self) -> None:
+        self._self_talk_timer.stop()
+
+    def close(self) -> None:
+        self.stop()
+        timer, self._self_talk_timer = self._self_talk_timer, None
+        if timer is not None:
+            try:
+                timer.deleteLater()
+            except RuntimeError:
+                pass
+
+    def _on_timeout(self) -> None:
+        window_alerts.on_self_talk_timeout(self)
+
+    def _show_self_talk_text(self, text: str) -> bool:
+        if self._bubble_blocked():
+            return False
+        return self._shell._show_bubble_text_for(
+            self._sprite, str(text), int(round(self._self_talk_duration_seconds * 1000)))
+
+    def _show_random_self_talk(self) -> bool:
+        """随机一条自言自语（文本或配图），落点 = 这只 sprite 自己的气泡。
+
+        抽样/出图概率复用 ``window_alerts`` 的纯逻辑函数；配图只走壳的预热缓存
+        （GUI 线程绝不付磁盘/解码税——冷缓存回退文本，与主宠同口径）。
+        """
+        if self._bubble_blocked():
+            return False
+        if self._sticky_bubble_active or self._alert_current is not None:
+            return False
+        now = time.monotonic()
+        if now - self._self_talk_images_checked_at > 60.0:
+            self._self_talk_images_checked_at = now
+            live = [path for path in self._self_talk_images if path.is_file()]
+            if len(live) != len(self._self_talk_images):
+                self._self_talk_images = live
+        picked = window_alerts.pick_self_talk_choice(
+            self._self_talk_texts, self._self_talk_images,
+            window_alerts.self_talk_image_chance(self))
+        if picked is None:
+            return False
+        kind, value = picked
+        duration_ms = int(round(self._self_talk_duration_seconds * 1000))
+        if kind == "image":
+            self._last_self_talk_text = None
+            follower = self._shell._bubble_for(self._sprite)
+            if follower is None:
+                return False
+            cache = getattr(self._shell, "_self_talk_image_cache", {})
+            image = cache.get(str(value))
+            if image is None or image.isNull():
+                self._shell._warm_shared_self_talk_images([str(value)])
+                if not self._self_talk_texts:
+                    return False
+                self._last_self_talk_text = self._self_talk_texts[0]
+                return self._show_self_talk_text(self._last_self_talk_text)
+            return follower.show_image(
+                value, duration_ms, image_scale=self._self_talk_image_scale,
+                pixmap=QPixmap.fromImage(image))
+        self._last_self_talk_text = value
+        return self._show_self_talk_text(value)
+
+
+def is_overlay_topology() -> bool:
+    """唯一拓扑判定入口（输入：显式 PET_RENDER_TOPOLOGY env + 主配置捕获开关）。
+
+    实现在零 Qt 的 ``overlay_settings_command``：设置进程（``--settings``，
+    ``pet/__main__.py`` 明确禁止导入 pet.app/overlay_shell）也要按拓扑决定
+    D12 指令通道走不走，故拓扑读取的实现必须落在两侧都能 import 的模块；
+    本函数保留为对外唯一入口名（app.py 照旧转发）。T4 起判定还读主配置的
+    ``stream_capture_mode``（勾选 = 重启级切到 legacy 单窗），细节见该模块。
+    """
+    return overlay_settings_command.is_overlay_topology()
+
+
+class _SettingsIdentityConfig:
+    """身份载体的 config 面（``open_settings_process`` 只读 ``instance_id``）。"""
+
+    __slots__ = ("instance_id",)
+
+    def __init__(self, instance_id: str) -> None:
+        self.instance_id = instance_id
+
+
+class _SettingsIdentity:
+    """D13：喂给 ``AppShell.open_settings_process`` 的身份载体（鸭子类型）。
+
+    该入口只读 ``instance.config.instance_id``：主宠的身份是 ``slot-0``、子 sprite
+    是 ``slot-N``，两者都非空 → 设置进程显式带 ``--instance slot-N`` 打开**这一只
+    自己的档案**（不再靠进程级 ``DSH_PET_INSTANCE`` 猜，主进程已把它固定成空串）。
+    这里不建 Config、不碰磁盘。
+    """
+
+    __slots__ = ("config",)
+
+    def __init__(self, instance_id: str) -> None:
+        self.config = _SettingsIdentityConfig(instance_id)
+
+
+def _screen_name(screen) -> str:
+    try:
+        return str(screen.name())
+    except Exception:
+        return "?"
+
+
+def _sprite_current_pixmap(sprite):
+    """sprite 已渲染帧 → 当前 clip 的 ``currentImage()`` → ``None``（帧未就绪）。
+
+    取图链与 ``sprite_menu_facade.icon_pixmap`` 同口径：先读 sprite 上已渲染的
+    ``_pixmap``，没有才回退当前 clip 的当前帧；两处都空 = 真的没有帧。
+    """
+    pm = getattr(sprite, "_pixmap", None)
+    if pm is not None and not pm.isNull():
+        return QPixmap(pm)
+    clip = getattr(sprite, "_clip", None)
+    current = getattr(clip, "currentImage", None)
+    image = current() if callable(current) else None
+    if image is None or image.isNull():
+        return None
+    return QPixmap.fromImage(image)
+
+
+def _crop_icon_pixmap(pm: QPixmap, size: int) -> QPixmap:
+    """裁掉帧的透明留白后等比缩放到 ``size``（旧 ``PetWindow._crop_icon_pixmap`` 同口径）。
+
+    动画帧是整张视频画布，直接缩放会把角色缩成几个像素（``context_menus/icons``
+    记录了同一个坑）；托盘与灵动岛头像共用这一份裁剪语义，不另造第二套。
+    """
+    image = pm.toImage()
+    bounds = QRegion(QBitmap.fromImage(image.createAlphaMask())).boundingRect()
+    if bounds.isValid() and not bounds.isEmpty():
+        pm = QPixmap.fromImage(image.copy(bounds))
+    return pm.scaled(size, size,
+                     Qt.AspectRatioMode.KeepAspectRatio,
+                     Qt.TransformationMode.SmoothTransformation)
+
+
+class ShellOverlayWindow(OverlayWindow):
+    """4.1a 产品 overlay：挂进程级驱动器 + 单击/拖拽区分。
+
+    仿真段不再经本类（M-2：驱动器独立持有控制器，tick 顺序协议在
+    tick_driver.TickDriver.tick_sim 固化）；overlay 只把 advance+paint 段
+    与鼠标路由做完。behavior 属性由壳层挂载，contextMenuEvent（基类）查表
+    读它。点击 vs 拖拽的阈值判定口径同 run_overlay_demo.py：按下位移小于
+    DRAG_THRESHOLD*scale 视为单击。
+    """
+
+    def __init__(self, screen, *, driver: TickDriver | None = None) -> None:
+        super().__init__(screen=screen, driver=driver)
+        self._press_pos = None
+        self.behavior = None  # 宿主挂载（ScreenHost）；contextMenuEvent 查表读它
+        self.edge_probe = None  # 宿主挂载；拖拽/点击事件接线
+        self.host = None  # 所在宿主（ScreenHost 构造时回填）
+        # 壳层注入：sprite → 当前宿主（跨屏移交后 sprite 已不在本窗的宿主里）。
+        # 未注入（裸 overlay / demo）= 恒本窗宿主。
+        self._host_for_sprite = None
+        # 真拖拽升级（过 DRAG_THRESHOLD）才通知探头取消会话（旧机语义：
+        # 按下只是点击候选，探头会话的点击拉直因此才有机会生效——按下即
+        # 取消会让 on_sprite_clicked 永远遇到 mode==OFF）。
+        self._drag_committed_cb = self._on_real_drag_started
+        self.setAcceptDrops(True)  # 4.1c 投喂（命中 sprite 才 accept）
+
+    def _host_of(self, sprite):
+        """该 sprite 当前的宿主（跨屏移交后不是本窗宿主，故必须回问壳层）。"""
+        resolve = self._host_for_sprite
+        if callable(resolve):
+            host = resolve(sprite)
+            if host is not None:
+                return host
+        return self.host
+
+    def _behavior_of(self, sprite):
+        """该 sprite 的行为控制器。
+
+        本窗自己的 sprite（含装配期直接挂在窗口上的替身）用窗口上那一份；
+        **跨屏移交之后**这只已归别的宿主，改问它的新宿主——否则松手那一刻的
+        点击/拖拽收尾会打在旧宿主的行为链上（换屏后第一次松手的动作丢失）。
+        """
+        host = self._host_of(sprite)
+        if host is None or host is self.host:
+            return self.behavior
+        return getattr(host, "behavior", None) or self.behavior
+
+    def _probe_of(self, sprite):
+        """该 sprite 所在屏的边缘探头世界（同上：移交后按新宿主取）。"""
+        host = self._host_of(sprite)
+        if host is None or host is self.host:
+            return self.edge_probe
+        return getattr(host, "probe", None) or self.edge_probe
+
+    # ---------------------------------------------------------------- 跨屏拖拽（壳层钩子）
+    def _sprite_event_pos(self, sprite, global_pos, local_pos) -> QPointF:
+        """事件坐标 → sprite 当前宿主局部坐标（见基类钩子）。
+
+        跨屏拖动时输入会话留在按下窗，而 sprite 已交给目标宿主的窗口：坐标必须
+        按**目标宿主**的全局原点换算，否则 ``on_move`` 会按差着一整块屏的偏移
+        落位（宠从光标下飞出画面）。
+        """
+        host = self._host_of(sprite)
+        overlay = getattr(host, "overlay", None) if host is not None else None
+        if overlay is None or overlay is self:
+            return local_pos
+        return QPointF(global_pos - overlay.geometry().topLeft())
+
+    def _follow_overlay(self, sprite):
+        """跟随方（气泡跟随器等）注册所在的窗口 = sprite 当前宿主的窗口。"""
+        host = self._host_of(sprite)
+        overlay = getattr(host, "overlay", None) if host is not None else None
+        return overlay if overlay is not None else self
+
+    def _on_real_drag_started(self, sprite) -> None:
+        probe = self._probe_of(sprite)
+        if probe is not None:
+            probe.on_sprite_drag_started(sprite)
+        cb = getattr(self, "_drag_opened_cb", None)
+        if callable(cb):
+            cb(sprite)  # 壳层：拖拽开始即开跨屏临时合法域（跨屏拖拽的唯一入口）
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        self._press_pos = event.position()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        # 跨屏移交**不在这里**判：拖动物理（弹簧档）的实际位移发生在 sprite.advance
+        # 里，事件时刻读到的是上一拍的位置——按它判会在身体真正过缝之前提前换宿主
+        # （宠被换到一块身体还没进入的屏上，随后被钳住 = 跨屏大跳）。移交统一由
+        # 驱动器"全部 overlay advance 之后"的钩子按实际身体位置判（每 tick 每只一次）。
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if self.slingshot.aiming:
+            # 弹弓瞄准中的左键松手 = 发射（基类已消费），不进单击/拖拽判别
+            self._press_pos = None
+            super().mouseReleaseEvent(event)
+            return
+        grab = self._mouse_grab
+        committed = self._drag_committed  # super() 的 _finish_grab 会清旗标，先快照
+        click_only = self._press_click_only  # 锁定位/SHIFT 门（同样先快照）
+        press, self._press_pos = self._press_pos, None
+        super().mouseReleaseEvent(event)
+        behavior = self._behavior_of(grab)
+        probe = self._probe_of(grab)
+        if grab is None or press is None or behavior is None:
+            return
+        threshold = catalog.DRAG_THRESHOLD * getattr(grab, "scale", 1.0)
+        # click_only：锁定位/未按 SHIFT 的按下（M5a/M5b）——位移再大也只算点击，
+        # 与旧机两处闸门「取消拖拽但保留点击」语义一致
+        if click_only or (not committed
+                          and (event.position() - press).manhattanLength() < threshold):
+            # 边缘探头消费点击（PEEKING 拉直/STRAIGHTENED 重置倒计时）时，
+            # 抑制点击反应与点击音效——拉直本身就是反馈
+            if probe is not None and probe.on_sprite_clicked(grab):
+                return
+            # M5e：点击触发黄金回旋（window.py:3356-3357 的同位置路由）。
+            # 返回 True = 本次点击被效果层消费（直连模式），不再播点击反应/音效
+            route_spin = getattr(self, "_click_route_spin", None)
+            if callable(route_spin) and route_spin(grab):
+                return
+            clicked = behavior.on_sprite_clicked(grab)
+            squash = getattr(grab, "squash", None)
+            if callable(squash):
+                squash()  # 4.1c 点击 Q 弹（window.py:3473 语义）
+            cb = getattr(self, "click_feedback", None)
+            if callable(cb):
+                cb()  # 4.1c 点击音效（有无 click 素材都发声，同旧架构）
+            # 点击气泡族（余额/自言自语）：回调由壳注入（与 click_feedback 同位置）。
+            # click_name = 本次点击实际绑定的动画名——只有 on_sprite_clicked 真改绑
+            # 了 click clip（返回 True）anim_of 才是点击动画名；无 click 素材时它
+            # 读到的是按下前/拖拽名的残留，按契约传 ""（调用方回退全局随机台词）。
+            click_cb = getattr(self, "_on_sprite_click", None)
+            if callable(click_cb):
+                anim_of = getattr(behavior, "anim_of", None)
+                click_name = anim_of(grab) if (clicked and callable(anim_of)) else None
+                click_cb(grab, str(click_name or ""))
+        elif probe is not None:
+            # 真拖拽释放（非单击）：通知探头按 tick 静止判定重新评估进入
+            probe.on_sprite_drag_released(grab)
+            # F1：真拖拽松手切回待机池（旧 window.py:3260-3264）。点击候选
+            # 分支不走这里——它由 on_sprite_clicked 改绑 click clip；无 click
+            # 素材时控制器的接管态自愈会在下一 tick 收回待机（不卡悬空动画）。
+            behavior.on_drag_released(grab)
+        else:
+            # 无探头世界：真拖拽松手的待机收尾同样要走到（F1）
+            behavior.on_drag_released(grab)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        feeding = getattr(self, "_feeding", None)
+        if feeding is not None:
+            feeding.handle_drag_enter(event)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        feeding = getattr(self, "_feeding", None)
+        if feeding is not None:
+            feeding.handle_drop(event)
+        else:
+            event.ignore()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        """4.1c：有全量菜单建造器（产品壳）走 facade 菜单，否则基类最小集。
+
+        D13：把**被点中的 sprite** 透传给建造器——菜单里的设置入口要按它自己的
+        config 身份打开（否则右击子肥鱼的「桌宠设置」会静默打开主宠配置）。
+
+        close_on_trigger 动作在菜单可见时会被 ``connect_action`` 挂起
+        （``shared.defer_menu_callback`` → 根菜单 ``_deferred_callbacks``），
+        window.py 在 ``menu.exec()`` 返回后统一派发；overlay 此前没人派发 →
+        所有 close_on_trigger 条目（AI 对话/桌宠设置/隐藏桌宠/退出…）点下去
+        静默无反应。这里补上同一条收口。
+        """
+        builder = getattr(self, "_full_menu_builder", None)
+        if builder is None:
+            super().contextMenuEvent(event)
+            return
+        target = self.sprite_at(event.pos())
+        if target is None:
+            event.ignore()
+            return
+        menu = builder(target)
+        menu.exec(event.globalPos())
+        self._dispatch_deferred_menu_callbacks(menu)
+        release_menu_tree(menu)
+        event.accept()
+
+    def _dispatch_deferred_menu_callbacks(self, menu) -> None:
+        """菜单关闭后派发挂起命令（window.py ``_show_context_menu`` 尾部等价物）。
+
+        定时器 context 绑**本窗**（长寿命）而不是菜单：菜单在事件返回后即无
+        Python 引用，绑定菜单会让 0ms 定时器随对象一起消失、命令永远不执行。
+        """
+        from .context_menus.shared import take_deferred_menu_callbacks
+
+        callbacks = take_deferred_menu_callbacks(menu)
+        if not callbacks:
+            return
+
+        def dispatch() -> None:
+            for callback in callbacks:
+                callback()
+
+        QTimer.singleShot(0, self, dispatch)
+
+    def reopen_context_menu(self, menu) -> None:
+        """按原位置重开右键菜单（菜单树重建后立即生效；window.py 同名方法等价物）。
+
+        QMenu 会把请求点挪到不出屏的位置，沿用用户实际看到的坐标（同
+        window.py ``reopen_context_menu`` 的 ``_context_menu_anchor`` 口径）。
+        """
+        if menu is None:
+            return
+        global_pos = QPoint(menu.pos())
+        menu.close()
+        QTimer.singleShot(
+            10, self, lambda: self._exec_full_menu_at(global_pos))
+
+    def _exec_full_menu_at(self, global_pos: QPoint) -> None:
+        builder = getattr(self, "_full_menu_builder", None)
+        if builder is None:
+            return
+        target = self.sprite_at(self.mapFromGlobal(global_pos))
+        if target is None:
+            return
+        menu = builder(target)
+        menu.exec(global_pos)
+        self._dispatch_deferred_menu_callbacks(menu)
+        release_menu_tree(menu)
+
+
+#: 活跃 OverlayShell 登记册（测试收口用，MovieLibrary._LIVE_MOVIE_LIBRARIES
+#: 同范式）：壳持 QTimer/监视器/加载线程/素材库，测试把它们留在共享
+#: QApplication 上漂到进程退出，就是全量套件/macOS CI 漂移段错误的累积源。
+_LIVE_OVERLAY_SHELLS: "weakref.WeakSet" = weakref.WeakSet()
+
+#: 图片解码串行锁（插件首用竞态防线）：Qt 的图片格式插件（dyld 装载 +
+#: QFactoryLoader 缓存）在多线程并发首用下会原生崩溃（mac CI 实锤）；后台
+#: 预热路径统一过它。GUI 线程的同步解码（首帧/跳帧）是既有路径不套它——
+#: 否则预热线程持锁时 GUI 同步解码会被反锁（吞吐倒挂）。
+_IMAGE_DECODE_LOCK = threading.Lock()
+
+#: 自言自语配图加载队列（单 worker 串行；见 ``_start_self_talk_image_load``）。
+#: 条目 = (cache, pending, edge, gen, gen_now)；gen_now 回读壳的换代戳。
+_SELF_TALK_LOAD_Q: "queue.Queue" = queue.Queue()
+
+#: 配图解码结果进程级共享（按绝对路径）：同一图片池只解码一次——overlay
+#: 多宠/多壳同池时不再每壳重解一遍（3 宠 = 3 倍解码的浪费就此消除），也
+#: 让测试期"每壳一批次"的队列积压从根上消失。目标长边变化（DPR/配图大小
+#: 热改）时整表清一次重建（与原来每壳各自重建的口径一致，只是范围变全局）。
+_SELF_TALK_IMAGE_CACHE_SHARED: dict = {}
+_SELF_TALK_IMAGE_CACHE_EDGE: "int | None" = None
+_self_talk_loader_started = False
+_self_talk_loader_lock = threading.Lock()
+
+
+def _self_talk_loader_loop() -> None:
+    """配图加载 worker：逐批次逐图串行解码（进程内唯一配图解码线程）。"""
+    while True:
+        item = _SELF_TALK_LOAD_Q.get()
+        if item is None:
+            return  # 收口哨兵（进程退出）
+        cache, pending, edge, gen, gen_now = item
+        for path in pending:
+            if gen != gen_now():
+                break  # 已换代：本批剩余作废
+            with _IMAGE_DECODE_LOCK:
+                if gen != gen_now():
+                    break  # 等锁期间被换代
+                img = QImage(path)
+                if img.isNull():
+                    continue
+                if img.width() > edge or img.height() > edge:
+                    img = img.scaled(
+                        edge, edge,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation)
+                cache[path] = img
+
+
+def _start_self_talk_loader() -> None:
+    """懒起配图加载 worker（幂等；进程级唯一，随进程退出消亡）。"""
+    global _self_talk_loader_started
+    with _self_talk_loader_lock:
+        if _self_talk_loader_started:
+            return
+        _self_talk_loader_started = True
+    threading.Thread(target=_self_talk_loader_loop, daemon=True,
+                     name="self-talk-img-loader").start()
+
+
+class OverlayShell(QObject):
+    """overlay 拓扑产品壳：主屏 overlay + 主 sprite + 进程级三控制器。
+
+    依赖最小化：QApplication + 主 PetInstance（config 与 per-pet MovieLibrary
+    身份源）。屏事件/会话事件/退出收口全部在本类内自接，AppShell 只在
+    拓扑分支处构造并 start()。
+
+    4.3 后半：本类同时是进程级共享子系统（agent_link / proactive）的呈现
+    扇出目标——``agent_link_manager`` / ``proactive_watcher`` 由 AppShell 在
+    拓扑分支处注入（等价 PetWindow 的构造参数）。注入失败=None 时全部呈现面
+    静默空转，绝不阻断启动。
+
+    4.3 收口（菜单 parity 配套）：本壳同时承担 PetWindow 的两处**服务宿主**——
+    音乐（歌词）控制器（``install_music_lyric`` 四件套）与「看看屏幕」worker
+    （``look_at_screen`` + ``look_done`` 信号），以及 sprite 版「黄金回旋」。
+    overlay 拓扑下 PetWindow 不再存在，这三项功能没有别的落点。
+    """
+
+    # 「看看屏幕」worker → GUI 线程（wire 口径同 PetWindow.look_done）
+    look_done = Signal(str, str, bool)
+
+    def __init__(self, app, instance, *, screen=None, sprite_factory=None,
+                 agent_link_manager=None, proactive_watcher=None) -> None:
+        super().__init__()
+        _LIVE_OVERLAY_SHELLS.add(self)  # 测试收口登记（构造即登记，幂等弱引用）
+        self.app = app
+        self._instance = instance
+        self._config = getattr(instance.config, "_main", instance.config)
+        # 多屏宿主表（首位 = 主宿主 = slot0 的窗口；见 screen_host.ScreenHost）。
+        # ``_initial_screen`` 只是构造期入参，建出主宿主后一切屏信息都从宿主读。
+        self._hosts: list = []
+        self._initial_screen = screen if screen is not None else app.primaryScreen()
+        # 允许桌宠跨屏（主配置全局键、**重启级**）：进程内快照一次，运行期不重读
+        # ——设置页改的是磁盘，勾一下就让正在跑的进程多出/收掉窗口不是这个开关的
+        # 语义（与 stream_capture_mode 同口径）。关闭时：只有启动时选定的那块屏
+        # （主宿主）有窗口，跨屏路由一律不换宿主（见 _host_for_restore /
+        # route_drag_to_screen / move_sprite_to_screen）。
+        self._cross_screen_allowed = bool(self._config.get("allow_cross_screen", False))
+        self._sprite_factory = sprite_factory or (
+            lambda lib, pos, scale: PetSprite(lib, pos=pos, scale=scale))
+        self._started = False
+        self._session_end_done = False
+        # 壳装配完成标记（``_build`` 末尾置真）：建壳期与活壳期对"换屏"的处置不同
+        # （见 ``_resite_main_host`` / ``_migrate_to_screen`` 的分工）。
+        self._built = False
+        # 音效预热一次性 latch：只在首次 start、overlay 可见前预热一次
+        #（_warm_sound_effects_once）；重 show / stop→start 不重复。
+        self._sound_warmed = False
+        self.driver: TickDriver | None = None
+        self.sprite = None
+        self.lib = None
+        self.tray: QSystemTrayIcon | None = None
+        self._tray_menu: QMenu | None = None
+        self._tray_actions: list = []
+        # 托盘逐只显隐勾选动作（M14：[sprite, QAction]，菜单重建时替换）
+        self._pet_visible_actions: list = []
+        self._session_watcher = None
+        # D12 指令通道（overlay 拓扑：独立设置进程 → 主进程）；未装时为惰性空转
+        self._command_watcher = None
+        self._command_timer = QTimer(self)
+        # 4.2b 子肥鱼登记：sprite 顺序 = spawn 顺序 = 活跃宠清单顺序
+        self._spawned: list = []
+        self._spawned_libs: dict = {}
+        self._spawned_slots: dict = {}
+        # B7b per-slot 取源：逐 sprite 的配置视图（配置同步边界重建）与子 sprite
+        # 的各自主气泡跟随器/自言自语宿主/ pet 形宿主。
+        self._sprite_cfg_cache: dict = {}
+        self._bubble_followers: dict = {}
+        self._sprite_hosts: dict = {}
+        self._self_talk_hosts: dict = {}
+        # 子宠 slot 配置的 (mtime_ns, size) 签名缓存：目录事件/既有 3s 兜底轮询时
+        # 用它筛出"配置真的变了"（只 stat；内容读只在命中变化时发生）。
+        self._slot_signature_cache = None
+        # 音乐（歌词）宿主：懒建（window_optional_services 同款生命周期）
+        self._music_lyric = None
+        # 「看看屏幕」限流/忙碌状态（window.py 同名口径）
+        self._look_busy = False
+        self._last_look_ts = 0.0
+        # 识屏发起者（右键命中的那一只）：构造期给确定值，`_look_bubble` 按它
+        # 分发；`look_at_screen` 每次调用都会重记。
+        self._look_sprite = None
+        self.look_done.connect(self._on_look_done)
+        # 黄金回旋：直接复用 golden_spin.GoldenSpinController（纯状态机：圈数
+        # 累计/逐圈加速/缓动），宿主适配器把角度写进 sprite 的整帧旋转通道。
+        # 懒建（默认关时不建对象、不 import golden_spin）。
+        self._golden_spin = None
+        # 弹弓会话（壳内唯一一份）：所有宿主窗共用，见 _wire_host_overlay
+        self._slingshot = None
+        self._golden_spin_host = _GoldenSpinSpriteHost(self)
+        self._golden_spin_target = None
+        # 4.3 后半：共享子系统注入（等价 PetWindow 的构造参数；None = 惰性空转）
+        self.agent_link_manager = agent_link_manager
+        self.proactive_watcher = proactive_watcher
+        # 呈现/提醒状态（PetWindow 同名私有面的 sprite 等价物；window_alerts 的
+        # host 形函数与 agent_link/proactive 的聚合读取都直接读这些属性）
+        self._alert_queue: deque = deque()
+        self._alert_current: dict | None = None
+        # 实际呈现当前提醒的气泡（G2-R6）：提醒目标会随主位交接换宠，
+        # 关闭提醒时要收起真正展示它的那只气泡，而不是新目标的空气泡。
+        self._alert_bubble = None
+        # 承载宠（G2）：一条提醒在屏期间只跟这一只——它退出/逐只隐藏/屏迁移时，
+        # 整条提醒交接给新的可见目标（同 ID、同剩余 TTL、恰好一份副本）；
+        # 主位回归只影响此后新产生的事件（不抢回）。见 _sync_alert_copy。
+        self._alert_presenter = None
+        # 首次呈现时刻/总时长（限时提醒的剩余 TTL 基准；迁移不重置，不永生）。
+        self._alert_presented_key = None
+        self._alert_presented_at = 0.0
+        self._alert_presented_ms = 0
+        # 承载气泡的生命周期收口期（宠退出/逐只隐藏/屏迁移重建）：期内的 hidden
+        # 信号不得被当成"用户收起了提醒"再挂一次（重放/递归的唯一闸门）。
+        self._alert_copy_teardown = False
+        # 提醒计时缝（单调时钟；测试注入可控时钟，不用墙钟等待赌时序）
+        self._alert_clock = time.monotonic
+        # 队列满时的处置计数（可诊断；见 window_alerts._admit_to_queue）
+        self._alert_overflow_count = 0
+        self._sticky_bubble_active = False
+        self._sticky_text = ""
+        self._sticky_subtitle = ""
+        self._sticky_buttons: list | None = None
+        self._bubble_busy_until = 0.0
+        self._bubble_suppressed = False
+        self._last_sticky_restore = 0.0
+        # 飞行中的 sprite 集合（B1）：被撞飞的那只禁气泡，其余宠不受影响。
+        # 由行为控制器的飞行边沿回调维护（见 _on_sprite_flight_changed），
+        # **不**复用 _bubble_suppressed——那个位同时是 proactive/联动节流信号
+        # （multi_window_shared / agent_link / todo_reminder 读它），飞行期置真
+        # 会把联动与主动搭话一起掐掉。
+        self._flying_sprites: set = set()
+        # 联动动作链（agent_link 的 request_link_anim/idle 落点）
+        self._pending_link_anim: str | None = None
+        self._link_anim_current: str | None = None
+        self._link_next_provider = None
+        self._link_chain: _LinkAnimChain | None = None
+        # 快速对话气泡（懒建；无聊天变体 = None 静默降级）
+        self._quick_chat = None
+        self._quick_chat_resolved = False
+        self._quick_chat_cls = None
+        self._build()
+        self._wire_screen_signals()
+        self._install_session_watcher()
+        self.app.aboutToQuit.connect(self._on_about_to_quit)
+
+    # ---------------------------------------------------------------- 屏宿主（多屏）
+    @property
+    def _main_host(self):
+        """主宿主（宿主表首位）。``self.overlay`` / ``_bounds`` / 三控制器都是它的面。
+
+        slot0 的窗口语义不变：主宿主就是"主宠那块屏"的窗口，单屏用户下它与
+        整个进程的窗口是同一个。多屏下其余屏各有自己的宿主（``_hosts[1:]``），
+        任何"整组"动作都必须遍历 ``_hosts``，不得借用主宿主的窗口。
+        """
+        return self._hosts[0] if self._hosts else None
+
+    @property
+    def _screen(self):
+        host = self._main_host
+        return host.screen if host is not None else None
+
+    @property
+    def _bounds(self) -> QRect:
+        host = self._main_host
+        return QRect(host.bounds) if host is not None else QRect()
+
+    @property
+    def overlay(self):
+        host = self._main_host
+        return host.overlay if host is not None else None
+
+    @property
+    def behavior(self):
+        host = self._main_host
+        return host.behavior if host is not None else None
+
+    @property
+    def collision(self):
+        host = self._main_host
+        return host.collision if host is not None else None
+
+    @property
+    def physics(self):
+        host = self._main_host
+        return host.physics if host is not None else None
+
+    @property
+    def _probe(self):
+        host = self._main_host
+        return host.probe if host is not None else None
+
+    @property
+    def _throw_egg(self):
+        host = self._main_host
+        return host.throw_egg if host is not None else None
+
+    def hosts(self) -> list:
+        """当前全部屏宿主（只读副本；首位 = 主宿主）。"""
+        return list(self._hosts)
+
+    def host_for_sprite(self, sprite):
+        """该 sprite 当前所在屏的宿主（``screen`` / ``overlay`` / ``bounds``）。
+
+        尚未落到任何宿主上的 sprite（spawn 建库期/已退出的对象）回落到主宿主——
+        调用方拿到的永远是"可用的那一块屏"，不会拿到 None。
+        """
+        for host in self._hosts:
+            if sprite in host.overlay.sprites:
+                return host
+        for host in self._hosts:
+            if host.screen is getattr(sprite, "home_screen", None):
+                return host
+        return self._main_host
+
+    def host_for_screen(self, screen):
+        """该屏的宿主；没有（该屏还没被任何宠占用）返回 None。"""
+        if screen is None:
+            return None
+        for host in self._hosts:
+            if host.screen is screen:
+                return host
+        return None
+
+    def _host_of(self, sprite):
+        """持有该 sprite 的宿主；不在任何宿主上返回 None（不回落）。"""
+        for host in self._hosts:
+            if sprite in host.overlay.sprites:
+                return host
+        return None
+
+    # ---------------------------------------------------------------- 构建
+    def _build(self) -> None:
+        # M-2 统一 tick 驱动器（T2）：进程级**一个**时钟驱动全部屏宿主；仿真段
+        # 按宿主分组（见 tick_driver.tick_sim），overlay 只做 advance+paint。
+        self.driver = TickDriver(self)
+        # 跨屏路由：全部 overlay advance 之后跑一次（每 tick 每只一次）——弹簧档的
+        # 实际位移发生在 advance 里，事件时刻判会提前移交（跨屏大跳的来源）。
+        self.driver.set_post_advance(lambda _dt: self.route_seam_after_advance())
+        # 主宿主（主屏）。slot0 的窗口语义挂在它上面：self.overlay / _bounds /
+        # 三控制器 / 探头 / 彩蛋都是它的面。
+        host = self._create_host(self._initial_screen)
+        # 4.1c 音效：点击 + 碰撞（click_sound 默认包，静默降级）。门/音量/音源都按
+        # **触发 sprite** 的身份配置取源（B7b）：碰撞事件带成员 id，由壳解析成
+        # sprite；点击由壳在 _on_sprite_click(sprite) 里带身份调用。播放器进程级
+        # 一个（`_wire_host` 已按宿主注册监听）。
+        self._sound = SpriteSoundPlayer(
+            self._config, host.collision,
+            config_for=self._sprite_config,
+            sprite_for_event=self._sound_sprite_for_event)
+        # 灵动岛与它的宿主归属（AppShell 建岛后 attach_island 接线）
+        self._island = None
+        self._island_host = None
+        # 4.1b 窗口能力状态（on_top/穿透复合/全屏与光标监视/runtime 避让标记）。
+        # 必须在**复活宠物之前**就位：主宠记着别的屏时，`_spawn_slot` 复活它的
+        # 那一步就会走宿主换屏（`_migrate_to_screen`），而换屏里要重下发窗口能力。
+        self._auto_hidden = False
+        self._user_mouse_through = bool(self._config.get("mouse_through", False))
+        self._auto_cursor_hidden = False
+        self._cursor_restore_pending = False
+        # 收敛请求的待办：被 grab 闸挡住的收敛不许丢弃，由 grab 收尾补做
+        # （见 _converge_auto_cursor_hidden / _on_grab_finished）。
+        self._converge_pending = False
+        from . import pet_profiles
+
+        config_dir = self._spawn_config_dir()
+        if config_dir:
+            migration = pet_profiles.migrate_slot0_profile(config_dir)
+            # 与 AppShell 同一口径（ops D2）：``target-corrupt`` 只牵连 slot0 这一份档案
+            # → 该槽不复活，别的照常；其余非 ok 状态（源配置坏了/备份失败/锁超时）
+            # 涉及全局面，照旧硬失败。两处判据必须同源，否则两个入口对同一次事故
+            # 给出不同处置（一个降级、一个炸）。
+            slot0_unusable = False
+            if not migration.ok:
+                if not migration.slot_only_problem:
+                    raise RuntimeError(str(migration))
+                slot0_unusable = True
+            pet_profiles.migrate_active_set(config_dir)
+            remembered = list(pet_profiles.load_active_set(config_dir).slots)
+            if slot0_unusable:
+                remembered = [n for n in remembered if n != 0]
+            self._remembered_active = remembered
+        else:
+            self._remembered_active = [0]
+            self._slot_memory = {0: {key: copy.deepcopy(self._config.get(key))
+                                    for key in pet_profiles.PER_PET_KEYS}}
+        if 0 in self._remembered_active:
+            self._spawn_slot(0)
+        # 4.2b：按活跃宠清单复活子肥鱼（D5：依据是运行时清单，不是 slot 配置存在）
+        self._restore_spawned_pets()
+        # 主宿主的投喂控制器在 ``_create_host`` 时就挂上了（那时还没有主宠，落点
+        # 兜底对象是 None）；宠复活/生成之后再挂一次，把"落点退回主宠"这一路补上。
+        self._bind_feeding(self._main_host)
+        self._watcher = FullscreenCursorWatcher(self)
+        self._watcher.fullscreen_changed.connect(self._on_fullscreen_changed)
+        self._watcher.cursor_visibility_changed.connect(
+            self._on_cursor_visibility_changed)
+        if self.sprite is not None:
+            self._bind_position_listener(self.sprite)
+        self._last_marker_write = 0.0
+        self._apply_window_capabilities()
+        # 4.1c 气泡跟随（真实 PetSpeechBubble；静默降级）
+        self._bind_bubble()
+        # 自言自语族（周期气泡 / 点击台词 / 配图 / 朗读）：旧架构唯一宿主是
+        # PetWindow（window.py:458-480 + :740），overlay 拓扑下必须由本壳装配
+        self._init_self_talk()
+        # 音乐自动唱歌（M5f）：轮询定时器 + 唱歌续播链（extras 尾段观测唱歌结束）
+        self._init_music_sing()
+        self._music_sing_chain = _MusicSingChain(self)
+        self.driver.add_extra_controller(self._music_sing_chain)
+        # 4.3 后半：联动动作链接续控制器（extras 尾段观测一次性动作结束边沿）
+        self._link_chain = _LinkAnimChain(self)
+        self.driver.add_extra_controller(self._link_chain)
+        self._install_shared_link()
+        self._build_tray()
+        self._install_settings_command_watch()
+        self._slot_signature_cache = self._slot_config_signatures()
+        self._announce_no_pets_if_empty()
+        self._built = True
+
+    def _announce_no_pets_if_empty(self) -> None:
+        """一只宠物都没有时**不许静默**（issue #286）。
+
+        零活跃宠物是一个合法状态（用户点过托盘「退出这只」、``overlay-active-pets.json``
+        损坏或版本不认识、slot0 档案降级被剥出活跃集），但旧口径下 overlay 拓扑照常
+        ``show()`` 一个全屏置顶空窗、legacy 拓扑只留一个托盘图标，**既不报错也不打
+        日志**：用户看到的是「进程在、托盘在、桌面上什么都没有」，而 CPU 停在 idle
+        （0 sprite 空窗停表，见 M12c），观感等同于"启动失败或被安全软件拦了"。
+
+        这里把事实说清楚：日志给排查，托盘 tooltip / 恢复窗给用户（无托盘时恢复窗是
+        唯一可见入口）。不造宠物、不碰档案——只陈述与指路。
+        """
+        if self._all_sprites():
+            return
+        reason = self._no_pets_reason()
+        active = list(getattr(self, "_remembered_active", ()) or ())
+        config_dir = self._spawn_config_dir() or getattr(self._config, "dir", None)
+        logging.warning(
+            "overlay: 启动后没有任何宠物（活跃集合=%s，配置目录=%s）：%s",
+            active, config_dir, reason)
+        text = (f"没有可显示的桌宠：{reason}\n"
+                "托盘（或本窗口）的「生成 / 恢复 slot0」可以重建。")
+        # 恢复窗开着且还是空白时补一句话（无托盘时它是唯一的可见入口）。
+        # **绝不写 ``_slot0_profile_diagnosis``**：那是"slot0 档案降级"的专用诊断源，
+        # ``_spawn_failure_text`` 会优先引用它、因而带上坏档案路径；塞一句笼统的
+        # "没有宠物"进去会把那条线索顶掉（本片首版就是这么踩的，
+        # `test_slot0_lifecycle` 的恢复窗用例当场红）。零宠物是另一回事，只走
+        # 日志、托盘 tooltip 与恢复窗的空白补齐。
+        label = getattr(self, "_recovery_diagnosis_label", None)
+        if label is not None:
+            try:
+                if not str(label.text() or ""):
+                    label.setText(text)
+                    label.setVisible(True)
+            except RuntimeError:  # 窗口已随进程销毁
+                pass
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            try:
+                tray.setToolTip(f"dsh-pet：没有可显示的桌宠（{reason}）")
+            except RuntimeError:
+                pass
+
+    def _no_pets_reason(self) -> str:
+        """零宠物的一句话原因：按三条已知入口如实陈述，不猜。"""
+        diagnosis = self.slot0_profile_diagnosis()
+        if diagnosis:
+            return diagnosis
+        active = list(getattr(self, "_remembered_active", ()) or ())
+        if not active:
+            return "活跃宠物清单为空（overlay-active-pets.json 里没有有效身份）"
+        return f"活跃清单 {active} 里的宠物都没能建起来（原因见日志）"
+
+    def _create_host(self, screen):
+        """建一块屏的宿主（含该屏的 overlay 与一份屏局部控制器），并接线到壳。
+
+        这是 ``_build`` 与"某只宠第一次落到新屏"共用的唯一入口——从旧的单窗装配
+        里**提取**出来，而不是各写一份。
+        """
+        bounds = self._local_bounds(screen)
+        overlay = ShellOverlayWindow(screen, driver=self.driver)
+        host = ScreenHost(screen, overlay, bounds)
+        self._hosts.append(host)
+        self._wire_host(host)
+        return host
+
+    def _wire_host(self, host) -> None:
+        """宿主接线：控制器回调、屏信号、overlay 上的壳层钩子、投喂。
+
+        overlay 重建（宿主换屏）时走同一入口，故这里是"哪些壳层面挂在窗口上"的
+        唯一清单——漏挂哪个，换屏之后那一路就静默丢失。
+
+        三条碰撞监听是**壳自己的绑定方法**（与单世界时代同一对象、同一签名），
+        逐屏世界各注册一份：世界只扇出自己那块屏的事件，而处理体按事件成员 id
+        回查宿主（见 ``_host_for_collision``），故多屏下不会重复执行、也不会认错屏。
+        """
+        host.behavior.on_flight_changed = self._on_sprite_flight_changed
+        # 唱歌续播判据（window.py:2595-2601）：行为层不查音频，只问这一面。缺它
+        # 则唱歌 clip 播完走掷骰链——约 60% 概率被切到随机动作，唱歌循环碎裂；
+        # 副屏那只同样要接（宿主级接线，故新宿主自动带上）。
+        host.behavior.sing_continue_provider = lambda: self._music_sing_active
+        host.collision.add_collision_listener(self._on_collision_squash)
+        host.collision.add_collision_listener(self._on_collision_probe)
+        host.collision.add_collision_listener(self._on_collision_sound)
+        # 边缘探头（edge_probe 移植）：tick 尾段（姿态最终写入口）；config 键
+        # edge_probe_enabled（默认 False）世界内每次进入判定前热读，设置页即切即生效
+        from .sprite_edge_probe import create_edge_probe_world
+        host.probe = create_edge_probe_world(self._config, QRect(host.bounds))
+        # throw_egg 彩蛋：探头被撞飞头部跟随速度（extras 尾段，读物理结算后的
+        # 速度——落地兜底依赖 physics 已切回 normal，顺序天然满足）
+        from .sprite_throw_egg import create_throw_egg_world
+        host.throw_egg = create_throw_egg_world(
+            QRect(host.bounds), probe=host.probe)
+        host.extras = [host.probe, host.throw_egg]
+        self._wire_host_overlay(host, host.overlay)
+        self._connect_host_screen(host)
+        self._bind_feeding(host)
+        if self._built:
+            # 运行期才第一次占用的屏：带上当前窗口级配置（置顶/穿透/锁位/不透明度），
+            # 否则新屏那张 overlay 一辈子是"出厂默认"（用户看到的是副屏的宠盖住
+            # 桌面、右键菜单点了也没反应）。不走整组刷新：那会把逐 sprite 设置连
+            # 档案一起重读一遍，而这一步发生在拖拽过缝的那一帧上。
+            self._apply_host_window_caps(host)
+            if self._any_host_visible():
+                # 整组现在是"显示中"（含已 start）：新窗必须跟着上屏，否则拖过去
+                # 的宠只被建窗不显示 = 用户眼里的"宠拖到别屏就不见了"。
+                host.overlay.show()
+                if self._started:
+                    host.overlay.start()
+            # 岛的墙只在有宿主的屏上存在：这块屏第一次有宠时把墙挂过来
+            self._sync_island_host()
+
+    def _wire_host_overlay(self, host, overlay) -> None:
+        """把壳层的窗口回调挂到该宿主的 overlay 上（新建与换屏共用一份清单）。"""
+        overlay.edge_probe = host.probe
+        overlay.click_feedback = self._click_feedback
+        # 点击气泡族（余额/点击自言自语）+ 点击音效：与 click_feedback 同位置注入
+        overlay._on_sprite_click = self._on_sprite_click
+        # M5e：点击触发黄金回旋路由（与 _on_sprite_click 同位置注入）
+        overlay._click_route_spin = self._route_click_golden_spin
+        # 4.1c 弹弓：controller 壳内一份（见下），这里只接 config
+        # （slingshot_enabled 热读，设置页即改即生效）
+        #
+        # 会话**壳内唯一一份**：瞄准会话可能开在按下窗、而被瞄准的 sprite 已经在
+        # 另一块屏上（拖拽跨屏之后才点右键），每条宿主窗各持一个控制器就会"会话
+        # 在 A、绘制要看 B"两处对不上（B 的控制器里没有会话，A 又画在错的坐标上）。
+        # 共用一份之后，绘制/脏区由持 sprite 的那张窗负责（见 OverlayWindow
+        # ``_paint_slingshot`` / ``_refresh_slingshot_visual`` 的归属换算）。
+        if self._slingshot is None:
+            from .sprite_slingshot import SlingshotController
+
+            self._slingshot = SlingshotController()
+        overlay.slingshot = self._slingshot
+        overlay.slingshot.config = self._config
+        # 4.1c 全量右键菜单（facade 适配旧 context_menus 建造器）
+        from .sprite_menu_facade import build_sprite_full_menu
+        overlay._full_menu_builder = (
+            lambda target: build_sprite_full_menu(self, target))
+        overlay._through_changed = self._on_user_through_changed
+        overlay._grab_finished_cb = self._on_grab_finished
+        # 穿透态收敛的两个时机（见 _converge_auto_cursor_hidden）：显示/恢复
+        # 与真到达窗口的鼠标输入，同一入口、同一语义
+        overlay._shown_cb = self._converge_auto_cursor_hidden
+        overlay._user_input_cb = self._converge_auto_cursor_hidden
+        # 跨屏拖拽：输入会话留在按下窗，坐标按 sprite 当前宿主换算；跟随方
+        # 也按 sprite 归属窗取（见 OverlayWindow._sprite_event_pos / _follow_overlay）
+        overlay._host_for_sprite = self.host_for_sprite
+        # 跨屏移交：**不在事件时刻判**（见 ShellOverlayWindow.mouseMoveEvent），
+        # 由驱动器"全部 overlay advance 之后"的钩子按这一拍的实际身体位置判
+        # （每 tick 每只一次）；拖拽开始即开跨屏临时合法域。
+        overlay._drag_opened_cb = self._open_seam_domain
+        # sprite-removed 三条注销监听（迁移/换屏重建 overlay 必须重挂，否则
+        # 退出任意一只宠都不再注销行为/探头/彩蛋状态）
+        self._wire_sprite_removed_hooks(overlay, host)
+
+    def _click_feedback(self) -> None:
+        """点击音效通道（overlay 的 ``click_feedback``，无参）。
+
+        绑壳方法而不是 ``self._sound.on_click``：宿主在 ``_build`` 里先于播放器
+        建出来（播放器要拿主宿主的碰撞世界当缺省世界），绑定对象必须等得及。
+        逐宠身份的那一份由 ``_on_sprite_click`` 另行播放（同一处判定通道）。
+        """
+        self._sound.on_click()
+
+    def _wire_sprite_removed_hooks(self, overlay, host=None) -> None:
+        """挂 sprite-removed 三条注销监听（``_build`` 与宿主换屏共用）。
+
+        ``overlay.remove_sprite`` 按这三条注销外部簿记：行为状态表
+        （``behavior.forget``）、边缘探头 armed/预进入状态（``probe.forget``）、
+        抛掷彩蛋角度（``throw_egg.forget``）。迁移重建 overlay 时漏挂，则
+        屏热插拔/主屏切换之后再退出任意一只宠都不再注销——每退一只泄漏一份
+        强引用（含 pixmap/命中图）与探头状态。
+        """
+        host = self._main_host if host is None else host
+        overlay.add_sprite_removed_listener(host.behavior.forget)
+        overlay.add_sprite_removed_listener(host.probe.forget)
+        overlay.add_sprite_removed_listener(host.throw_egg.forget)
+
+    def _create_main_library(self):
+        """per-pet MovieLibrary（T3）；角色素材缺失回退默认角色（口径同
+        AppShell._create_ui_with_character_fallback）。"""
+        return self._create_library_for(
+            str(self._sprite_config(self.sprite).get('character', catalog.DEFAULT_CHARACTER)),
+            fallback_writer=self._slot_writer(0))
+
+    def _create_library_for(self, character_id, *, fallback_writer=None):
+        """按角色 id 建 per-pet 库；素材缺失回退默认角色（写回发起方那份配置）。
+
+        ``fallback_writer`` = 回退时把角色写回哪份配置（缺省 = 主配置；子 sprite
+        切角色时传它自己的 slot 写入器——回退绝不许污染主宠的角色）。
+        """
+        cid = str(character_id or catalog.DEFAULT_CHARACTER)
+        try:
+            return self._instance._create_library(cid)
+        except FileNotFoundError:
+            if cid == catalog.DEFAULT_CHARACTER:
+                raise
+            logging.warning('角色 %s 素材缺失，回退默认角色 %s',
+                            cid, catalog.DEFAULT_CHARACTER)
+            if fallback_writer is not None:
+                if not fallback_writer('character', catalog.DEFAULT_CHARACTER):
+                    raise RuntimeError("默认角色回写失败，未应用角色回退")
+            else:
+                self._config.set('character', catalog.DEFAULT_CHARACTER)
+            self._library_fallback_used = True
+            return self._instance._create_library(catalog.DEFAULT_CHARACTER)
+
+    @staticmethod
+    def _local_bounds(screen) -> QRect:
+        """屏幕可用工作区换算成 overlay 局部坐标（overlay 铺满屏幕几何）。"""
+        geo = screen.geometry()
+        avail = screen.availableGeometry()
+        return QRect(avail.x() - geo.x(), avail.y() - geo.y(),
+                     avail.width(), avail.height())
+
+    @staticmethod
+    def _default_corner_pos(bounds: QRect, rect: QRect) -> QPointF:
+        """默认右下角（对齐 window_placement._default_corner_pos 的旧算式：
+        右缘留 CORNER_MARGIN、底贴可用区底）。"""
+        return QPointF(bounds.x() + bounds.width() - 1 - rect.width() - catalog.CORNER_MARGIN,
+                       bounds.y() + bounds.height() - 1 - rect.height())
+
+    # ---------------------------------------------------------------- 主 sprite 接线
+    def _bind_feeding(self, host=None) -> None:
+        """投喂控制器逐宿主挂，落点按 ``sprite_at`` 逐只判定（B02）：拖到哪只就
+        吃哪只、气泡也落那只。
+
+        overlay/宿主窗口更换后必须重挂，否则投喂命中判定仍打在旧窗口的几何上
+        （4.2b 主实例提升同理）；每块屏的窗口各挂一份，副屏上的宠才吃得到拖进去
+        的文件（拖放事件只送到光标下那张窗）。
+
+        ``host=None`` = 重建主宿主的控制器（旧的 ``self._feeding`` 语义）。
+        """
+        from .sprite_feeding import SpriteFeedingController
+        host = self._main_host if host is None else host
+        if host is None:
+            return
+        primary = self.sprite if host is self._main_host else None
+        feeding = SpriteFeedingController(
+            host.overlay, primary, self._config, host.behavior)
+        feeding._bubble_cb = self._say_feeding_bubble
+        # 解读询问接缝由壳持有：重建控制器时回填，否则主宠提升/屏迁移之后
+        # 拖文件解读静默失效。
+        feeding.interpret_offer = getattr(self, "_file_interpret_offer", None)
+        host.feeding = feeding
+        host.overlay._feeding = feeding
+        if host is self._main_host:
+            self._feeding = feeding
+
+    def set_file_interpret_offer(self, offer) -> None:
+        """注入拖文件解读询问回调（app 侧 ``FileInterpretController.offer``）。
+
+        overlay 拓扑下 PetWindow 不构造，``file_eater`` 的 ``interpret_offer``
+        接缝没有别的宿主：AppShell 持有解读控制器，经本方法把 ``offer(paths)``
+        挂到当前投喂控制器上（``sprite_feeding`` 吃完后调用，口径同旧
+        ``file_eater.eat_paths:183-186``）。传 None = 解除。
+        """
+        self._file_interpret_offer = offer
+        for host in self._hosts:
+            feeding = host.feeding
+            if feeding is not None:
+                feeding.interpret_offer = offer
+
+    def _bind_bubble(self) -> None:
+        """主 sprite 的气泡跟随器；重建前先关旧跟随器（防旧顶层气泡残留）。
+
+        4.3 后半：跟随器接上点击回调（快速对话入口）+ ``hidden_signal``
+        （提醒队列推进/粘滞气泡恢复，``window_alerts.on_speech_bubble_hidden``），
+        并按聊天可用性切换气泡的可点状态。
+
+        自言自语族：气泡风格（``self_talk_bubble_style``）与「气泡文字大小」
+        （``bubble_text_scale``）此前在 overlay 拓扑下被静默降级成默认值——
+        旧架构由 PetWindow 构造期注入（window.py:454-478），这里补齐同一注入。
+
+        B7b：主 sprite 之外，每只子 sprite 也各有**自己那只**气泡（旧架构一窗
+        一气泡，"点小肥鱼 → 气泡出现在小肥鱼头顶"）；已在册的子宠跟随器幂等补齐。
+        """
+        follower = getattr(self, "_bubble_follower", None)
+        if follower is not None:
+            follower.close()
+        self._bubble_follower = (self._make_bubble_follower(self.sprite)
+                                 if self.sprite is not None else None)
+        self._bind_main_bubble_signals()
+        for sprite in list(self._spawned):
+            self._ensure_sprite_bubble(sprite)
+
+    def _bind_main_bubble_signals(self) -> None:
+        """主气泡的 hidden 信号/可点态接线（构造后与"提升者跟随器接管"共用）。"""
+        bubble = self._speech_bubble
+        if bubble is not None:
+            self._apply_bubble_text_scale(bubble, self._sprite_config(self.alert_target_sprite()))
+            self._connect_alert_hidden(bubble)
+        if self._quick_chat_resolved:
+            # 快速对话可用性已解析过（不重付 import 成本）：新气泡直接对齐
+            # 可点状态；否则等首次冒泡时由 show_bubble 的
+            # _apply_bubble_interactive 惰性解析（与 legacy 触点一致）。
+            self._apply_bubble_interactive()
+
+    def _connect_alert_hidden(self, bubble) -> None:
+        """把一只气泡的 hidden 信号接进提醒推进链（**同一只只接一次**）。
+
+        承载气泡可能不是主气泡：slot0 缺席时 ``_speech_bubble`` 就是某只子宠的
+        气泡，而 ``_bind_bubble`` 会随 slot0 生灭反复调用——同一只子宠气泡被接
+        两次的话，一次隐藏会触发两次推进（第一条 resolved 后第二次会顺手清掉刚
+        弹上来的下一条，等于静默跳过提醒）。标记打在气泡对象上，正好"一只一次"。
+        """
+        if bubble is None or getattr(bubble, "_alert_hidden_wired", False):
+            return
+        try:
+            bubble.hidden_signal.connect(self._on_speech_bubble_hidden)
+        except (AttributeError, RuntimeError, TypeError):
+            logging.debug("overlay: 气泡 hidden 信号接线失败", exc_info=True)
+            return
+        bubble._alert_hidden_wired = True
+
+    def _make_bubble_follower(self, sprite):
+        """按 sprite 的**自己那份**配置建一只气泡跟随器（风格/字号 per-slot）。
+
+        跟随器把宿主窗口记进自身（原点来源 + 位置监听注册表），故必须挂在这只宠
+        **当前所在屏**的窗口上——多屏下拿主宿主的窗口建跟随器，副屏那只的气泡会
+        被算到主屏坐标上（锚点整体偏一整块屏）。
+        """
+        cfg = self._sprite_config(sprite)
+        host = self.host_for_sprite(sprite)
+        follower = SpriteBubbleFollower(
+            host.overlay, sprite, on_clicked=self._on_bubble_clicked,
+            style_id=str(cfg.get(
+                "self_talk_bubble_style", DEFAULT_SELF_TALK_BUBBLE_STYLE)
+                or DEFAULT_SELF_TALK_BUBBLE_STYLE))
+        self._apply_bubble_text_scale(getattr(follower, "bubble", None), cfg)
+        return follower
+
+    def _ensure_sprite_bubble(self, sprite) -> None:
+        """子 sprite 的气泡跟随器（幂等：已建即返回）。"""
+        if sprite is None or sprite is getattr(self, "sprite", None):
+            return
+        if self._bubble_followers.get(sprite) is not None:
+            return
+        try:
+            self._bubble_followers[sprite] = self._make_bubble_follower(sprite)
+        except Exception:
+            logging.debug("overlay: 子 sprite 气泡建失败", exc_info=True)
+
+    def _close_sprite_bubble(self, sprite) -> None:
+        """退出一只子 sprite：收掉它那只气泡窗（否则留孤儿顶层气泡）。"""
+        follower = self._bubble_followers.pop(sprite, None)
+        if follower is None:
+            return
+        try:
+            follower.close()
+        except Exception:
+            logging.debug("overlay: 子 sprite 气泡收尾失败", exc_info=True)
+
+    def _bubble_for(self, sprite):
+        """该 sprite 的气泡跟随器（主 = 壳的主跟随器；子 = 各自主跟随器）。"""
+        if sprite is None or sprite is getattr(self, "sprite", None):
+            return getattr(self, "_bubble_follower", None)
+        return self._bubble_followers.get(sprite)
+
+    def _show_bubble_text_for(self, sprite, text: str, duration_ms: int,
+                              **kwargs) -> bool:
+        """把一条气泡发给**指定 sprite** 的那只气泡（主 sprite 走壳的原路径）。
+
+        该 sprite 没有跟随器（未建/建失败/已退出）时回退主气泡——气泡是提醒/
+        答复的呈现面，宁可降级到主宠头顶也不静默吞掉。
+        """
+        if sprite is None or sprite not in self._all_sprites():
+            return False
+        follower = self._bubble_for(sprite)
+        if follower is None:
+            return False
+        # 子宠自己冒泡也要对齐可点态（G2-R1）：不能依赖主宠冒泡路径的
+        # _apply_bubble_interactive 副作用，槽重建后的新跟随器同理。
+        follower.set_interactive(self.quick_chat_available())
+        return bool(follower.show(str(text), int(duration_ms), **kwargs))
+
+    def _hide_bubble_for_sprite(self, sprite) -> None:
+        """收起指定 sprite 的气泡（不影响其它 sprite 的气泡）。"""
+        follower = self._bubble_for(sprite)
+        if follower is not None:
+            follower.hide()
+
+    def _sprite_speech_visible(self, sprite) -> bool:
+        """该 sprite 的"可冒泡"态：整窗可见（含全屏自动隐藏）且这只自己没被隐藏。"""
+        if sprite is None or sprite not in self._all_sprites() or not self.isVisible():
+            return False
+        return self._sprite_visible(sprite)
+
+    def _sprite_host(self, sprite):
+        """sprite 的 pet 形宿主（余额/识屏等 host 形消费方用；主 = 壳本身）。"""
+        if sprite is None:
+            return self
+        host = self._sprite_hosts.get(sprite)
+        if host is None:
+            host = _SpritePetHost(self, sprite)
+            self._sprite_hosts[sprite] = host
+        return host
+
+    def sprite_presenter(self, sprite=None):
+        """发起 sprite 的**代次呈现器**（手动服务结果：余额 / 天气的落点）。
+
+        与 :meth:`_sprite_host` 的差别：它带 ``presentation_available`` 判据，让"请求
+        在飞时把发起宠关掉"变成"只取消呈现"，而不是让迟到结果落到别宠/重建出来的同槽
+        新住客身上。每次调用返回新的轻量对象（不缓存、不进 ``_sprite_hosts``）——它的
+        代次判据来自壳的实时 sprite 清单，不需要身份共享，也就不需要新的清理点。
+        自动定时余额不走这里（``QTimer.timeout → show_balance()`` 的 parent 为 None，
+        仍按全局动态落点），两者语义分开（2026-10-10 终审 A10）。
+
+        主 sprite 缺席（无宠）时返回 ``None``，调用方回退壳本身。
+        """
+        target = self.sprite if sprite is None else sprite
+        if target is None:
+            return None
+        return _SpriteServicePresenter(self, target)
+
+    def on_sprite_scale_changed(self, sprite=None) -> None:
+        """sprite 缩放变更后的气泡刷新（旧机 ``window.py:1000-1004`` 等价物）。
+
+        气泡画布尺寸/内容内边距按 ``pet_scale`` 排（思考泡泡尤甚），而缩放只发
+        脏区、不发位置通知——跟随器无从自行感知，必须由改大小的那一侧显式调
+        （旧机在 ``change_scale`` 后直接 ``bubble.reflow(新锚点, pet_scale=新scale)``）。
+        B7b：每只 sprite 有自己的跟随器，按被改的那一只刷新（子宠不再静默跳过）。
+        """
+        follower = self._bubble_for(sprite)
+        if follower is None:
+            return
+        reflow = getattr(follower, "reflow", None)
+        if not callable(reflow):
+            return
+        try:
+            reflow()
+        except Exception:
+            logging.debug("overlay: 气泡按新缩放重排失败", exc_info=True)
+
+    def _refresh_sprite_bubble_style(self, sprite) -> None:
+        """按该 sprite 自己那份配置重设气泡风格/文字大小 + 刷新锚点（配置热改）。"""
+        follower = self._bubble_for(sprite)
+        bubble = getattr(follower, "bubble", None)
+        if bubble is not None:
+            cfg = self._sprite_config(sprite)
+            set_style = getattr(bubble, "set_style", None)
+            if callable(set_style):
+                set_style(str(cfg.get(
+                    "self_talk_bubble_style", DEFAULT_SELF_TALK_BUBBLE_STYLE)
+                    or DEFAULT_SELF_TALK_BUBBLE_STYLE))
+            self._apply_bubble_text_scale(bubble, cfg)
+        refresh_anchor = getattr(follower, "refresh_anchor", None)
+        if callable(refresh_anchor):
+            try:
+                refresh_anchor()
+            except Exception:
+                logging.debug("overlay: 气泡锚点刷新失败", exc_info=True)
+
+    def _apply_bubble_text_scale(self, bubble, cfg=None) -> None:
+        """把「气泡文字大小」注入气泡控件（window.py:472-478 的 sprite 等价物）。
+
+        getattr 守卫保留：测试替身气泡（``_BubbleStub`` 等）不实现
+        ``set_text_scale``，守卫缺失会把无关用例打红。``cfg`` = 该 sprite 的
+        配置来源（缺省主配置）。
+        """
+        setter = getattr(bubble, "set_text_scale", None)
+        if not callable(setter):
+            return
+        source = self._config if cfg is None else cfg
+        try:
+            scale = float(source.get("bubble_text_scale", 100) or 100) / 100.0
+            setter(max(0.5, min(3.0, scale)))
+        except Exception:
+            logging.debug("overlay: 气泡文字缩放注入失败", exc_info=True)
+
+    # ---------------------------------------------------------------- B7b：per-slot 取源
+    #
+    # 旧架构每只桌宠是独立进程，各读自己的 config-slot-N.json；单进程壳把这条
+    # 身份→配置的对应关系收敛成下面几个点：读（``_sprite_config``）、写
+    # （``persist_sprite_setting``）、同步（``_apply_sprite_settings_to``）、以及
+    # 子 sprite 各自的气泡/自言自语宿主。
+    def _sprite_config(self, sprite):
+        """一只 sprite 的配置来源（主 sprite = 主配置对象本身，子 = slot 视图）。
+
+        子 sprite 的视图带 per-slot 快照，只在配置同步边界重建
+        （``_invalidate_sprite_configs``）——点击/碰撞事件链上逐次读文件是磁盘税。
+        """
+        view = self._sprite_cfg_cache.get(sprite)
+        if view is None:
+            view = _SpriteConfig(self, sprite)
+            self._sprite_cfg_cache[sprite] = view
+        return view
+
+    def _invalidate_sprite_configs(self) -> None:
+        """配置同步边界：丢弃 per-slot 快照（下一次取源重新读文件）。"""
+        self._sprite_cfg_cache = {}
+
+    def _sound_sprite_for_event(self, event):
+        """碰撞事件 → 参与的宠物 sprite（音效按触发 sprite 的身份配置取门/音量）。
+
+        事件只带成员 id（``SpriteCollisionWorld._member_id``）。旧架构每只宠各自
+        按自己的 cfg 播自己那一声，单进程壳里没有"每只都播一遍"的落点，取
+        **参与碰撞的第一只宠物**（先 ``event.a`` 后 ``event.b``；pair 含岛等静态
+        成员时自然落到宠那一只）——旧版每进程播自己那只，这里取其一。多屏下逐屏
+        查全部成员（同一 id 只属于一块屏）。
+        """
+        ids = {getattr(event, "a", None), getattr(event, "b", None)}
+        ids.discard(None)
+        if not ids:
+            return None
+        from .sprite_collision import SpriteCollisionWorld
+        for sprite in self._all_sprites():
+            try:
+                if SpriteCollisionWorld._member_id(sprite) in ids:
+                    return sprite
+            except Exception:
+                continue
+        return None
+
+    def persist_sprite_setting(self, sprite, key: str, value) -> bool:
+        """一只 sprite 的逐只设置落盘（旧"写本窗自己那份 config"的等价物）。
+
+        主 sprite → 本进程主配置（``Config.set`` + ``save``，口径不变）；子 sprite
+        → 它自己的 ``config-slot-N.json``（原子写单键，**绝不碰主配置**——那是另
+        一只宠的身份，写脏就是审计 C1/C2 的"改子宠却改了主宠"）。
+        """
+        target = self.sprite if sprite is None else sprite
+        name = str(key or "")
+        if not name or target is None:
+            return False
+        slot = 0 if target is self.sprite else self._spawned_slots.get(target)
+        if slot is None:
+            return False
+        ok = self._slot_writer(slot)(name, value)
+        if ok:
+            self._sprite_cfg_cache.pop(target, None)
+            self._slot_signature_cache = None
+        return ok
+
+    def _stored_screen_name(self, config_dir, slot) -> str | None:
+        """档案里记着的**屏归属**（没有记忆/读不到 = None；只读，绝不创建）。"""
+        from . import pet_profiles
+
+        profile = pet_profiles.read_slot_profile(config_dir, slot)
+        if not profile.exists:
+            return None
+        name = str(profile.data.get("screen_name") or "")
+        return name or None
+
+    def _save_child_geometry(self, sprite, *, slot=None, geometry=None) -> bool:
+        """这只宠的位置自存：写 ``rx``/``ry``/``facing``/``scale``（+ 待写的屏归属）。
+
+        **比例与屏归属都属于"这只宠本该在的那块屏"**，按承载屏与归属是否一致分两路：
+
+        - **一致**（常态：单屏用户、有意换屏之后）→ 照旧写比例；有"待写的屏归属"
+          （有意换屏，见 :meth:`_remember_sprite_screen`）时与比例**同一次原子写、
+          同一把目录锁**落盘；
+        - **不一致 = 临时承载**（关闭跨屏时被摆在启动那块屏、或归属那块屏临时不在线
+          ／被拔掉）→ **一个几何键都不写**：临时那块屏上的比例若落盘，用户重新开启
+          跨屏后就回不到原来那块屏上的原位置——只保住屏名不等于保住位置。
+
+        于是单屏普通拖动持久化不受影响（不是"关闭时一律禁写"），而"关闭／缺屏 →
+        再开回来"能严格回到原来的比例。
+        """
+        from . import pet_profiles
+
+        slot = self._spawned_slots.get(sprite) if slot is None else slot
+        config_dir = self._spawn_config_dir()
+        if slot is None or not config_dir:
+            return False
+        token = getattr(sprite, "_profile_generation", None)
+        if token is None:
+            logging.warning("overlay: slot-%s 没有已应用快照的 token，拒绝几何自存", slot)
+            return False
+        host_name = _screen_name(self.host_for_sprite(sprite).screen)
+        pending = getattr(sprite, "_pending_screen_assignment", None)
+        assignment = pending or self._stored_screen_name(config_dir, slot)
+        if assignment is not None and assignment != host_name:
+            logging.debug("overlay: slot-%s 临时承载在 %s（归属 %s），本次几何自存跳过",
+                          slot, host_name, assignment)
+            return False
+        geometry = (self._sprite_geometry(sprite, self.host_for_sprite(sprite).bounds)
+                    if geometry is None else geometry)
+        writes_assignment = pending is not None and bool(geometry)
+        if writes_assignment:
+            geometry = dict(geometry)
+            geometry["screen_name"] = pending
+        result = pet_profiles.write_profile_geometry(
+            config_dir, slot, geometry, generation=token)
+        if result.status != "ok":
+            logging.warning("overlay: slot-%s 几何未保存：%s (%s)",
+                            slot, result.status, result.reason)
+            return False
+        if writes_assignment:
+            sprite._pending_screen_assignment = None
+        return True
+
+    def _apply_child_profile(self, slot) -> bool:
+        sprite = self._sprite_for_slot(slot)
+        if sprite is None:
+            if slot == 0:
+                self._sprite_cfg_cache.pop(None, None)
+                self._sync_chat_surfaces(str(self._sprite_config(None).get("character")))
+            return True
+        self._sprite_cfg_cache.pop(sprite, None)
+        cfg = self._sprite_config(sprite)
+        if cfg.status not in ("ok", "memory"):
+            logging.warning("overlay: slot-%s 快照未应用：%s", slot, cfg.status)
+            return False
+        center = QPointF(sprite.body_rect().center())
+        screen = getattr(sprite, "home_screen", None) or self.host_for_sprite(sprite).screen
+        character = str(cfg.get("character") or catalog.DEFAULT_CHARACTER)
+        if character != getattr(sprite, "_profile_character", character):
+            if not self._switch_child_character(sprite, character, persist=False):
+                return False
+            character = getattr(sprite, "_profile_character", character)
+            cfg._values["character"] = character
+        sprite = self._sprite_for_slot(slot)
+        if sprite is None:
+            return False
+        self._apply_sprite_settings_to(sprite, cfg)
+        sprite.facing = cfg.get("facing", "left")
+        body = sprite.body_rect()
+        sprite.set_pos(QPointF(sprite.pos) + center - QPointF(body.center()))
+        sprite.home_screen = screen
+        sprite.collision_enabled = bool(cfg.get("collision_enabled"))
+        self._refresh_sprite_bubble_style(sprite)
+        self._reload_self_talk_hosts([sprite])
+        if slot == 0 and hasattr(self, "_self_talk_timer"):
+            self._load_self_talk_settings()
+            self._schedule_self_talk()
+            self._sync_chat_surfaces(character)
+        sprite._profile_character = character
+        sprite._profile_generation = cfg.generation
+        return True
+
+    # ---- 子 sprite 的自言自语宿主（各自计时；主 sprite 仍走壳自身的机）----
+    def _ensure_self_talk_host(self, sprite):
+        """子 sprite 的自言自语宿主（幂等）；主 sprite/未知身份返回 None。"""
+        if sprite is None or sprite is getattr(self, "sprite", None):
+            return None
+        host = self._self_talk_hosts.get(sprite)
+        if host is None:
+            host = _SpriteSelfTalkHost(self, sprite)
+            self._self_talk_hosts[sprite] = host
+        return host
+
+    def _self_talk_host(self, sprite):
+        """该 sprite 的自言自语宿主（主 sprite = 壳自身，兼容 host 形调用）。"""
+        if sprite is None or sprite is getattr(self, "sprite", None):
+            return self
+        return self._self_talk_hosts.get(sprite)
+
+    def _close_self_talk_host(self, sprite) -> None:
+        host = self._self_talk_hosts.pop(sprite, None)
+        if host is not None:
+            host.close()
+
+    def _schedule_self_talk_for(self, sprite, *, after_display: bool = False) -> None:
+        """按 sprite 排下一次自言自语（主 = 壳的表，子 = 它自己的单发表）。"""
+        if sprite is None or sprite is getattr(self, "sprite", None):
+            self._schedule_self_talk(after_display=after_display)
+            return
+        host = self._self_talk_hosts.get(sprite)
+        if host is not None:
+            host.reload()
+            host.schedule(after_display=after_display)
+
+    def _stop_all_self_talk_hosts(self) -> None:
+        for host in list(self._self_talk_hosts.values()):
+            host.stop()
+
+    def _resume_all_self_talk_hosts(self) -> None:
+        for host in list(self._self_talk_hosts.values()):
+            host.schedule()
+
+    def _reload_self_talk_hosts(self, sprites) -> None:
+        """指定子宠的 self_talk 配置热改（配置同步边界）：重读 + 重排下一次。"""
+        for sprite in list(sprites):
+            host = self._self_talk_hosts.get(sprite)
+            if host is None:
+                continue
+            host.reload()
+            host.schedule()
+
+    def _init_self_talk(self) -> None:
+        """自言自语状态装配 + 周期定时器（``window.py:458-480`` / ``:740`` 对齐）。
+
+        overlay 拓扑下 PetWindow 不构造，这一族（周期气泡、点击台词、配图、
+        朗读）没有别的宿主，缺这一步就整族静默失效。文本池走
+        ``window_alerts.read_self_talk_texts``（host 形共享实现）；DEFAULT
+        常量取 ``pet/config.py``（不在壳里依赖 ``pet.window`` 的再导出面）。
+        """
+        self._load_self_talk_settings()
+        self._self_talk_timer = QTimer(self)
+        self._self_talk_timer.setSingleShot(True)
+        self._self_talk_timer.timeout.connect(self._on_self_talk_timeout)
+        self._schedule_self_talk()  # 首次排程（window.py:740）
+
+    def _load_self_talk_settings(self) -> None:
+        """（重）读 self_talk 族配置字段。构造期由 _init_self_talk 调一次；
+        运行期配置变更由 refresh_settings 再调——否则改开关/间隔/点击行为
+        /配图目录要重启才生效（「改了没反应」会被当成 bug 报回来）。"""
+        config = self._sprite_config(self.sprite)
+        self._self_talk_enabled = self.sprite is not None and bool(config.get("self_talk_enabled", False))
+        self._self_talk_texts = window_alerts.read_self_talk_texts(
+            config.get("self_talk_texts"))
+        self._self_talk_duration_seconds = max(
+            1.0, min(300.0, float(config.get(
+                "self_talk_duration_seconds", DEFAULT_SELF_TALK_DURATION_SECONDS))))
+        self._self_talk_image_dir = str(config.get("self_talk_image_dir", "") or "")
+        self._self_talk_images = list_self_talk_images(
+            _resolve_self_talk_image_dir(self._self_talk_image_dir))
+        self._self_talk_image_scale = max(
+            0.5, min(3.0, float(config.get("self_talk_image_scale", 100)) / 100.0))
+        self._self_talk_min_interval = max(
+            5.0, float(config.get(
+                "self_talk_min_interval", DEFAULT_SELF_TALK_MIN_INTERVAL)))
+        self._self_talk_max_interval = max(
+            self._self_talk_min_interval,
+            float(config.get(
+                "self_talk_max_interval", DEFAULT_SELF_TALK_MAX_INTERVAL)))
+        # 点击路径共享：实际显示的文本（图片气泡显式记 None，朗读据此静默）
+        self._last_self_talk_text: str | None = None
+        # 表达风格 picker：window_alerts.expression_style_text 惰性建，先占位
+        self._expression_picker = None
+        self.click_show_balance = bool(config.get("click_show_balance", False))
+        self.click_show_self_talk = bool(config.get("click_show_self_talk", False))
+        # 配图缓存按**签名**重建（清单 mtime/size + 目标显示尺寸），后台解码预热
+        # ——GUI 只在出泡时取缓存（同步读图是 100-256ms 慢帧源，py-spy 实测）。
+        # 签名没变就什么都不做：绝大多数 refresh 改的是气泡风格/间隔这类与配图
+        # 无关的键，旧实现每次都清空重解全部配图（24 张 36.8MB 的 CPU+IO）。
+        signature = self._self_talk_image_cache_signature()
+        if (getattr(self, "_self_talk_image_cache_sig", None) == signature
+                and getattr(self, "_self_talk_image_cache", None)):
+            self._self_talk_images_checked_at = time.monotonic()
+            return
+        self._self_talk_image_cache = {}
+        self._self_talk_image_cache_sig = signature
+        self._self_talk_images_checked_at = time.monotonic()
+        self._warm_self_talk_images()
+
+    def _install_shared_link(self) -> None:
+        """把本壳接进共享联动链（``AppShell._wire_shared_subsystems`` 的等价物）。
+
+        共享 manager 的 ``win`` 是 ``MultiWindowProxy``，其 ``__init__`` 期
+        注入 provider 时 overlay 壳还不存在（AppShell.start() 才构造），
+        扇出集合为空 → provider 永远送不到。这里由壳自接一次；legacy 路径
+        仍由 app.py 在每窗创建后调用，两边不重叠。
+        """
+        shared = getattr(getattr(self._instance, "shell", None), "_shared", None)
+        if shared is None:
+            return
+        try:
+            shared.proxy.set_link_next_provider(shared.agent_link._next_busy_anim)
+        except Exception:
+            logging.debug("overlay: 接入共享联动链失败", exc_info=True)
+
+    # ---------------------------------------------------------------- 4.3 后半：共享子系统呈现面
+    #
+    # 本段是 PetWindow 呈现面的 sprite 等价物，消费方是进程级共享子系统：
+    #   - ``MultiWindowProxy``（agent_link / proactive 的 win）：读聚合状态属性
+    #     （isVisible/_dragging/_physics_mode/_click_effect_phase/mouse_through/
+    #     _bubble_busy_until/_bubble_suppressed/_sticky_bubble_active/
+    #     _alert_current/_alert_queue/agent_link_manager）并调用呈现方法；
+    #   - ``window_alerts`` 的 host 形函数：show_alert/resolve_alert/
+    #     pump_alerts/clear_alerts/hide_bubble/on_speech_bubble_hidden/
+    #     set_bubble_suppressed——直接复用同一份提醒队列实现（不重复造）。
+    # 缺失任一方法只会让对应功能静默降级，绝不抛到调用方。
+    @property
+    def _speech_bubble(self):
+        """**当前目标**的气泡控件（PetWindow._speech_bubble 的等价物；无气泡=None）。
+
+        提醒当前实际承载在哪只气泡上是另一件事（见 ``_alert_bubble`` /
+        ``alert_bubble``）：提醒迁移到子宠后，当前目标可能已经不是它了。
+        """
+        target = self.alert_target_sprite()
+        return getattr(self._bubble_for(target), "bubble", None) if target is not None else None
+
+    def _sprite_for_bubble(self, bubble):
+        """该气泡属于哪只 sprite（无主 → None）。"""
+        if bubble is None:
+            return None
+        follower = getattr(self, "_bubble_follower", None)
+        if follower is not None and getattr(follower, "bubble", None) is bubble:
+            return self.sprite
+        for sprite, item in self._bubble_followers.items():
+            if item is not None and getattr(item, "bubble", None) is bubble:
+                return sprite
+        return None
+
+    def _sprite_origin(self, sprite=None) -> QPoint:
+        """该 sprite 所在宿主窗口的全局原点（气泡/锚点/标记的换算源）。
+
+        没有 sprite（无宠期）时取主宿主原点——调用方据此仍能给出稳定坐标。
+        """
+        host = self.host_for_sprite(sprite) if sprite is not None else self._main_host
+        if host is None:
+            return QPoint()
+        return host.overlay.geometry().topLeft()
+
+    def bubble_anchor_rect_for(self, bubble=None) -> QRect:
+        """某只气泡的锚点矩形（全局）：按**它自己那只宠**算。
+
+        ``window_alerts`` 的 host 形函数经这一面取锚点：提醒可以迁移到子宠
+        （G2），锚点若按"当前目标"算，子宠气泡会被放到主位头顶上。给不出对象
+        （气泡已随宠销毁）时回退当前目标。原点取**该宠所在屏**的宿主原点：多屏下
+        拿主屏原点会把副屏那只的气泡锚到别的显示器上。
+        """
+        sprite = self._sprite_for_bubble(bubble)
+        if sprite is None:
+            sprite = self.alert_target_sprite()
+        if sprite is None:
+            return QRect()
+        return sprite_anchor_rect_global(sprite, self._sprite_origin(sprite))
+
+    @property
+    def cfg(self):
+        """PetWindow 同名的配置面。
+
+        host 形消费者（``MusicLyricController`` / ``window_alerts`` 的若干分支）
+        直接读 ``win.cfg``；本壳内部用 ``_config``，这里补一个只读别名，避免
+        为了别名去改那些共享实现。
+        """
+        return self._config
+
+    @property
+    def scale(self) -> float:
+        """主 sprite 缩放（气泡字号/锚点的 pet_scale 来源）。"""
+        return float(getattr(self.alert_target_sprite(), "scale", 1.0) or 1.0)
+
+    def isVisible(self) -> bool:  # noqa: N802 (Qt/PetWindow 命名)
+        """聚合可见性 = overlay 是否可见（隐藏/全屏自动隐藏都算不可见）。"""
+        return self.alert_target_sprite() is not None
+
+    def visible_content_rect(self) -> QRect:
+        """主 sprite 身体框的全局矩形（气泡锚点；window_placement 口径的 sprite 版）。"""
+        target = self.alert_target_sprite()
+        if target is None:
+            return QRect()
+        return sprite_anchor_rect_global(target, self._sprite_origin(target))
+
+    @property
+    def _dragging(self) -> bool:
+        """拖拽中（proactive G1 守卫的 interacting 判定之一）：任一屏的窗口持有 grab。"""
+        return any(getattr(host.overlay, "_mouse_grab", None) is not None
+                   for host in self._hosts)
+
+    @property
+    def _physics_mode(self):
+        """'drag'/'throw'/None——**必须保持哨兵语义**（None = 不在物理模式）。
+
+        消费方读 ``getattr(win, "_physics_mode", None) is not None``：返回
+        ``False`` 会让 G1 恒真拦截（multi_window_shared 的同款注释记录了
+        legacy 侧踩过的坑）。
+        """
+        state = getattr(self.sprite, "interaction_state", None)
+        if state == INTERACTION_DRAG:
+            return "drag"
+        if state == INTERACTION_THROWN:
+            return "throw"
+        return None
+
+    @property
+    def _click_effect_phase(self) -> int:
+        """sprite 世界没有点击效果相位（旧路径的 squash 相位计数）→ 恒 0。"""
+        return 0
+
+    @property
+    def mouse_through(self) -> bool:
+        """鼠标穿透态（窗口级设置逐宿主下发；任一窗口穿透即报真）。"""
+        return any(bool(getattr(host.overlay, "mouse_through", False))
+                   for host in self._hosts)
+
+    @property
+    def cats(self) -> dict:
+        """素材分类（联动动作链按 acts 名筛选用）。失败回空字典，不抛。"""
+        return self._sprite_categories(self.alert_target_sprite())
+
+    def _sprite_categories(self, sprite) -> dict:
+        """一只 sprite 的素材分类（None 或取用失败 → 空字典，不抛）。
+
+        手动互动（点击路由）必须按**发起的那只**取素材，不能按自动提示落点取：
+        点子宠时落点是可见的 slot0，用它的素材判断"有没有点击动画"会判错。
+        """
+        if sprite is None:
+            return {}
+        try:
+            return dict(self.host_for_sprite(sprite).behavior._categories(sprite.library))
+        except Exception:
+            logging.debug("overlay: 取素材分类失败", exc_info=True)
+            return {}
+
+    @property
+    def idles(self) -> list:
+        return list(self.cats.get("idles", []) or [])
+
+    @property
+    def on_look_synced(self):
+        """主动识屏答复同步进 AI 会话（``PetInstance.sync_look_to_chat`` 注入面）。
+
+        无聊天变体 / 未启用聊天 → None（proactive 侧 callable 判定后静默跳过）；
+        这正是 app.py ``_wire_window`` 里 ``win.on_look_synced`` 的等价注入。
+        """
+        if not self._chat_enabled():
+            return None
+        return getattr(self._instance, "sync_look_to_chat", None)
+
+    @property
+    def hidden_bubble_redirect(self):
+        """桌宠隐藏时的气泡改道面（灵动岛反馈气泡；``window_alerts`` 读它）。
+
+        可见时返回 None：改道只在隐藏期有意义，且 AppShell 的
+        ``_island_feedback_bubble`` 用 ``_aggregate_pet_visible()``（读
+        ``instances[].win``）判定——overlay 拓扑下恒为 False，故这里先按
+        本壳自己的可见性过滤，语义与 legacy 逐条对齐。
+
+        agent_link 侧经共享 ``MultiWindowProxy`` 读到本属性（proxy 仅在
+        overlay 拓扑转发它，见 multi_window_shared）。
+        """
+        if self.isVisible():
+            return None
+        shell = getattr(self._instance, "shell", None)
+        redirect = getattr(shell, "_island_feedback_bubble", None)
+        return redirect if callable(redirect) else None
+
+    # ---- 飞行期气泡门禁（B1：鱼飞行过程中不弹气泡）----
+    def _sprite_in_flight(self, sprite=None) -> bool:
+        """该 sprite 是否正在飞行（``sprite=None`` = 主 sprite）。"""
+        target = self.sprite if sprite is None else sprite
+        return target is not None and target in self._flying_sprites
+
+    def _bubble_blocked(self, sprite=None) -> bool:
+        """统一气泡门禁：设置页抑制期 **或** 该 sprite 正在飞行。
+
+        这是 ``window_alerts.bubble_blocked(host, sprite)`` 读的那一面（壳上
+        只有一个真值来源）；``_bubble_suppressed`` 仍是设置页/联动的聚合位，
+        两者**不可**互相赋值——飞行集合按 sprite 判定，飞的那只禁泡、其他宠
+        照常冒泡（见 ``_flying_sprites``）。
+        """
+        if self._bubble_suppressed:
+            return True
+        return self._sprite_in_flight(sprite)
+
+    def _on_sprite_flight_changed(self, sprite, flying: bool) -> None:
+        """飞行边沿（行为控制器回调）：进飞行收气泡，落地恢复提醒队列。
+
+        进飞行：把该 sprite 记进飞行集合（此后它的一切气泡入口都读
+        ``_bubble_blocked``），并**立即**收掉它当前那只气泡（复用
+        ``window_alerts.set_bubble_suppressed`` True 分支的动作口径：就地
+        hide）——被撞飞瞬间嘴边还挂着气泡是最显眼的穿帮。
+
+        出飞行：先从集合摘除，主 sprite 落地时再走 ``window_alerts`` 的恢复
+        分支（粘滞提醒重挂 / 限时提醒按原时长续上 → 超时后正常推进队列；该
+        分支自带门禁复判，设置页仍开着时不破门）。子 sprite 落地只摘集合：
+        提醒队列的呈现面是主 sprite 的气泡，子宠的飞行不该推动主宠的队列。
+        """
+        if flying:
+            self._flying_sprites.add(sprite)
+            self._hide_bubble_for_sprite(sprite)
+            return
+        self._flying_sprites.discard(sprite)
+        if sprite is not self.sprite or self._speech_bubble is None:
+            return
+        window_alerts.restore_after_suppression(self)
+
+    # ---- 气泡呈现（PetWindow.show_bubble / hold_bubble 等价）----
+    def show_bubble(self, text: str, duration_ms: int = 3200,
+                    subtitle: str | None = None, *, sticky: bool = False,
+                    buttons: list | None = None, title_first: bool = False,
+                    width_locked: bool = False, **_ignored) -> bool:
+        """向主 sprite 头顶冒泡（window.py:3850-3886 的 sprite 等价语义）。
+
+        返回是否真上了屏：不可见/飞行期/正挂提醒让路时为 False。免打扰结束的
+        汇报走 ``window_alerts.report_quiet_summary`` 的回退气泡面，它按这个
+        返回值确认交付——丢弃却报成功会把暂存排空（用户什么都没看到）。
+        """
+        if not self.isVisible() or self._bubble_blocked():
+            return False
+        if self._speech_bubble is None:
+            return False
+        if not sticky and not buttons and self._alert_current is not None:
+            return False  # 有提醒在展示：普通气泡让路，绝不覆盖审批弹窗
+        if sticky or buttons:
+            self._sticky_bubble_active = True
+            self._sticky_text = str(text)
+            self._sticky_subtitle = str(subtitle or "")
+            self._sticky_buttons = list(buttons) if buttons else None
+            return self._show_bubble_text(self._sticky_text, 0,
+                                          subtitle=self._sticky_subtitle,
+                                          sticky=True, buttons=self._sticky_buttons)
+        self._apply_bubble_interactive()
+        self.hold_bubble(duration_ms / 1000.0 + 2.0)
+        return self._show_bubble_text(str(text), duration_ms,
+                                      subtitle=str(subtitle or ""),
+                                      title_first=title_first,
+                                      width_locked=width_locked)
+
+    def alert_target_sprite(self):
+        if not self._any_host_visible():
+            return None
+        visible = [s for s in self._all_sprites() if self._sprite_visible(s)]
+        return min(visible, key=lambda s: self._spawned_slots.get(s, 0), default=None)
+
+    def _show_bubble_text(self, text: str, duration_ms: int, **kwargs) -> bool:
+        target = self.alert_target_sprite()
+        follower = self._bubble_for(target) if target is not None else None
+        if follower is None:
+            return False
+        return follower.show(text, duration_ms, **kwargs)
+
+    def hold_bubble(self, seconds: float) -> None:
+        """声明重要气泡占用时长（联动/识屏气泡在此期间让路）。"""
+        self._bubble_busy_until = max(
+            self._bubble_busy_until, time.monotonic() + max(0.0, float(seconds)))
+
+    def hide_bubble(self) -> None:
+        """主动关闭当前气泡并推进提醒队列（window_alerts 同源实现）。
+
+        收的是**提醒实际承载**的那只气泡（可能已随承载宠迁移）；无可见宠 /
+        全隐藏时也不早退——``_alert_current`` 必须能立即清掉（不碰已销毁对象）。
+        """
+        stale, prev = self._alert_bubble, self._alert_current
+        window_alerts.hide_bubble(self)
+        self._settle_alert_bubble(stale, prev)
+
+    def clear_alerts(self) -> None:
+        """清空提醒队列并关闭当前提醒（DSH 离线/重启收口）。"""
+        stale, prev = self._alert_bubble, self._alert_current
+        window_alerts.clear_alerts(self)
+        self._settle_alert_bubble(stale, prev)
+
+    def show_alert(self, text: str, *, subtitle: str = "", duration_ms: int = 0,
+                   buttons: list | None = None, sticky: bool = True,
+                   alert_id: str = "", priority: int = 3,
+                   alert_type: str = "watchdog", metadata: dict | None = None) -> None:
+        """提醒入队（审批/问题/硬失败/卡住提醒；一次只展示一个）。"""
+        stale, prev = self._alert_bubble, self._alert_current
+        window_alerts.show_alert(
+            self, text, subtitle=subtitle, duration_ms=duration_ms,
+            buttons=buttons, sticky=sticky, alert_id=alert_id,
+            priority=priority, alert_type=alert_type, metadata=metadata)
+        self._settle_alert_bubble(stale, prev)
+
+    def resolve_alert(self, alert_id: str) -> None:
+        """按 alert_id 精确收起某条提醒（并发审批各自定位，不误关他人）。"""
+        stale, prev = self._alert_bubble, self._alert_current
+        window_alerts.resolve_alert(self, alert_id)
+        self._settle_alert_bubble(stale, prev)
+
+    def set_bubble_suppressed(self, suppressed: bool) -> None:
+        """设置页打开期间暂停气泡（PetWindow.set_bubble_suppressed 等价）。"""
+        window_alerts.set_bubble_suppressed(self, suppressed)
+
+    def _pump_alerts(self) -> None:
+        """弹出队首提醒（window_alerts 的 host 回调面）。"""
+        stale, prev = self._alert_bubble, self._alert_current
+        window_alerts.pump_alerts(self)
+        self._settle_alert_bubble(stale, prev)
+
+    def _settle_alert_bubble(self, stale, prev) -> None:
+        """提醒收起/推进/交接收口后对齐呈现气泡（G2）。
+
+        ``stale``/``prev`` 是操作前的呈现气泡与当前提醒：current 换成新条目
+        （新事件或同 ID 升级）时按"新事件才优先主位"重记承载者，并把旧承载气泡
+        上残留的那一份收掉（孤儿气泡）；current 清空时整体复位承载状态。
+        最后统一走 :meth:`_sync_alert_copy` 保证"当前提醒恰好一份可见副本"。
+        """
+        cur = self._alert_current
+        if cur is None:
+            self._alert_presenter = None
+            self._alert_presented_key = None
+            self._alert_bubble = None
+            self._dismiss_stale_bubble(stale)
+            return
+        if cur is not prev:
+            self._note_alert_presented(cur)
+            prev_id = "" if prev is None else str(prev.get("id", "") or "")
+            if not (prev_id and prev_id == str(cur.get("id", "") or "")):
+                # 新条目：window_alerts 刚把它呈在**当前目标**上（新事件优先主位）
+                self._alert_presenter = self.alert_target_sprite()
+                self._alert_bubble = self._speech_bubble
+            self._dismiss_stale_bubble(stale)
+        self._sync_alert_copy()
+
+    # ---- 提醒承载宠（G2）：一条提醒一份可见副本，随承载宠迁移 ----
+    def _sync_alert_copy(self, *, force: bool = False) -> None:
+        """保证当前提醒**恰好一份可见副本**落在它的承载宠上（提醒生命周期唯一漏斗）。
+
+        语义（逐条来自 G2 裁决）：
+        - 承载宠仍是有效可见宠 → 副本就地保留：主位回归、别的宠显隐都**不抢回**；
+          副本当前不可见（整窗隐藏/飞行期/设置页抑制）时只记"待恢复"，绝不在
+          不可见期冒泡（那会漏出不该出现的顶层气泡）；``force=True`` 用于恢复
+          路径（抑制解除/落地/整窗显示）：副本还在但不可见时补挂回来；
+        - 承载宠退出 / 逐只隐藏 / 屏迁移（跟随器重建）→ 有其它可见宠时整条**交接**：
+          同 event ID、同剩余 TTL、不重新入队、不出声，旧副本一并收掉；
+        - 没有可见宠 → 不触碰任何已销毁的 QObject；current 留着待恢复，
+          ``resolve`` 时立即清掉且不复活（见 ``window_alerts.resolve_alert``）。
+        """
+        cur = self._alert_current
+        if cur is None:
+            self._alert_presenter = None
+            self._alert_bubble = None
+            return
+        presenter = self._alert_presenter
+        if presenter is not None and not self._alert_presenter_usable(presenter):
+            # 承载宠退出/被隐藏：旧气泡一并作废（对象可能已随它销毁，只清引用）
+            presenter = None
+            self._alert_presenter = None
+            self._alert_bubble = None
+        if presenter is None:
+            presenter = self.alert_target_sprite()
+        if presenter is None or not self._alert_window_visible():
+            # 无可见宠 / 整窗隐藏：副本无处可挂（也不碰已销毁对象），current 留着
+            self._alert_presenter = presenter
+            self._alert_bubble = None
+            return
+        intact = self._alert_copy_intact(cur, presenter)
+        if intact and not (force and not self._alert_copy_visible()):
+            self._alert_presenter = presenter
+            # 承载气泡的 hidden 信号必须接上：子宠气泡默认不接线，不接就没人
+            # 驱动"限时提醒超时 → 清 current → 推进队列"（队列会卡死）。
+            self._wire_alert_hidden(self._bubble_for(presenter))
+            return
+        self._present_alert_on(presenter, cur)
+
+    def _resume_alert_copy(self) -> None:
+        """抑制/飞行/整窗隐藏结束后的提醒恢复：强制按承载宠重挂那一份副本。"""
+        self._sync_alert_copy(force=True)
+
+    def _alert_presenter_usable(self, sprite) -> bool:
+        """承载宠是否仍可用：还在册（没退出）且逐只可见。"""
+        if sprite is None or sprite not in self._all_sprites():
+            return False
+        return self._sprite_visible(sprite)
+
+    def _alert_window_visible(self) -> bool:
+        """任一宿主窗口真的在屏上（提醒副本的上屏前提）。"""
+        return any(host.overlay.isVisible() for host in self._hosts)
+
+    def _alert_copy_intact(self, item, sprite) -> bool:
+        """承载宠的气泡上是否仍挂着这一条（**不看可见性**：隐藏 ≠ 换承载）。
+
+        只看"这只气泡还是不是承载宠的那只、正文还是不是这条"：气泡被换成新的
+        （屏迁移/槽重建/宠退出/显隐切换）→ False（需要重挂）；仅仅被收起（隐藏）
+        → True，由 hidden/300ms 防抖/恢复链路决定何时补挂。本漏斗抢着补的话，
+        防抖会被绕过，"隐藏→立刻重挂"变成无界循环。
+        """
+        bubble = self._alert_bubble
+        follower = self._bubble_for(sprite)
+        if bubble is None or follower is None or follower.bubble is not bubble:
+            return False
+        try:
+            text = str(getattr(bubble, "_raw_text", "") or "")
+        except RuntimeError:  # 气泡已随它那只宠销毁
+            return False
+        return text == str(item.get("text", ""))
+
+    def _alert_copy_visible(self) -> bool:
+        """当前副本是否真的在屏上（对象已销毁 → False，不抛）。"""
+        bubble = self._alert_bubble
+        try:
+            return bool(bubble is not None and bubble.isVisible())
+        except RuntimeError:  # 气泡已随它那只宠销毁
+            return False
+
+    def _alert_detach_copy(self) -> None:
+        """摘掉副本引用（那只气泡即将被关闭时先摘）。
+
+        关闭动作会发 ``hidden_signal``——引用还挂着的话，那条"气泡被收起"会被
+        当成用户收起提醒，立刻重挂一次（重放）。重新挂由调用方在收口后走
+        :meth:`_sync_alert_copy` 决定（承载宠若还活着就用它的新气泡）。
+        """
+        self._alert_bubble = None
+
+    def _note_alert_presented(self, item) -> None:
+        """记下这一条**首次**呈现的时刻与总时长（限时提醒的剩余 TTL 基准）。
+
+        键取 event 身份（有 id 用 id，无 id 用条目对象身份）：同 ID 的升级不该把
+        限时提醒的 TTL 重置回整段——"迁移不重置、不永生"的判据就在这里。
+        """
+        key = item.get("id") or id(item)
+        if self._alert_presented_key == key:
+            return
+        self._alert_presented_key = key
+        self._alert_presented_at = float(self._alert_clock())
+        self._alert_presented_ms = int(
+            item.get("duration_ms") or window_alerts.DEFAULT_ALERT_DURATION_MS)
+
+    def _alert_remaining_ms(self, item) -> int:
+        """限时提醒的剩余展示时长（单调时钟；迁移不重置，走完即收口）。"""
+        total = self._alert_presented_ms if self._alert_presented_key == (
+            item.get("id") or id(item)) else int(
+            item.get("duration_ms") or window_alerts.DEFAULT_ALERT_DURATION_MS)
+        elapsed = max(0.0, float(self._alert_clock()) - float(self._alert_presented_at))
+        return max(0, int(total) - int(elapsed * 1000.0))
+
+    def _present_alert_on(self, sprite, item) -> bool:
+        """把 current 挂到指定宠的气泡上（交接/恢复的唯一写入口；不出声、不入队）。"""
+        follower = self._bubble_for(sprite)
+        if follower is None or follower.bubble is None:
+            return False
+        if self._bubble_blocked(sprite):
+            # 这一只正在飞行 / 设置页抑制期：不上屏，留给恢复分支
+            return False
+        self._note_alert_presented(item)
+        sticky = bool(item.get("sticky"))
+        duration_ms = 0
+        if not sticky:
+            duration_ms = self._alert_remaining_ms(item)
+            if duration_ms <= 0:
+                # 剩余 TTL 已走完（迁移路上到点）：按正常超时收口，不复活
+                self._retire_alert(item)
+                return False
+        old = self._alert_bubble
+        if old is not None and old is not follower.bubble:
+            try:
+                old.dismiss()          # 旧副本收掉 → 始终恰好一份
+            except RuntimeError:       # 旧住客的气泡已随它的宠销毁
+                pass
+        try:
+            follower.show(
+                str(item.get("text", "")), duration_ms,
+                subtitle=str(item.get("subtitle", "") or ""),
+                sticky=sticky, buttons=item.get("buttons"))
+        except RuntimeError:
+            return False
+        self._wire_alert_hidden(follower)
+        self._alert_presenter = sprite
+        self._alert_bubble = follower.bubble
+        return True
+
+    def _retire_alert(self, item) -> None:
+        """限时提醒到期收口：清 current 并推进队列（到点即收，不靠迁移长生）。"""
+        if self._alert_current is not item:
+            return
+        self._alert_current = None
+        self._alert_presenter = None
+        self._alert_presented_key = None
+        self._alert_bubble = None
+        self._clear_sticky_state()
+        self._pump_alerts()
+
+    def _wire_alert_hidden(self, follower) -> None:
+        """把承载气泡的 hidden 信号接进提醒推进链（幂等；承载宠可能是子宠）。
+
+        子宠气泡默认不接线（主气泡在 ``_bind_main_bubble_signals`` 接）：只有它
+        真的承载过提醒时才接，并且 ``_on_speech_bubble_hidden`` 还有发送者身份
+        过滤兜底——别的宠自己的气泡收起时绝不误推进/误清当前提醒。
+        """
+        self._connect_alert_hidden(getattr(follower, "bubble", None))
+
+    def _dismiss_stale_bubble(self, stale) -> None:
+        """收起旧承载气泡上残留的那一份（它已不是当前副本的落点）。"""
+        if stale is None or stale is self._alert_bubble:
+            return
+        try:
+            if stale.isVisible():
+                stale.dismiss()
+        except RuntimeError:  # 旧住客的气泡已被 Qt 销毁
+            pass
+
+    def _on_speech_bubble_hidden(self, *_args, **_kwargs) -> None:
+        """气泡隐藏后的恢复/队列推进（PetWindow 同款委托）。
+
+        两道闸门（缺一个就会重放/递归）：
+        - **收口期**：承载气泡正因为宠退出/逐只隐藏/屏迁移被关掉，期间发出的
+          hidden 信号不是"用户收起了提醒"，直接忽略，重挂由 ``_sync_alert_copy`` 决定；
+        - **发送者身份**：只有承载气泡的隐藏才驱动队列；子宠自己的自言自语/普通
+          气泡收起与提醒无关，必须早退（否则误推进、误清当前提醒）。
+        """
+        if self._alert_copy_teardown:
+            return
+        cur = self._alert_current
+        if cur is not None and self._alert_bubble is not None:
+            sender = self.sender()
+            if sender is not None and sender is not self._alert_bubble:
+                return
+        stale, prev = self._alert_bubble, self._alert_current
+        window_alerts.on_speech_bubble_hidden(self)
+        self._settle_alert_bubble(stale, prev)
+
+    def _clear_sticky_state(self) -> None:
+        self._sticky_bubble_active = False
+        self._sticky_text = ""
+        self._sticky_subtitle = ""
+        self._sticky_buttons = None
+
+    # ---- 自言自语族（window.py:3686-3708 的 sprite 等价 host 面）----
+    def _schedule_self_talk(self, *, after_display: bool = False) -> None:
+        """排下一次自言自语（``window_alerts.schedule_self_talk`` host 形转发）。"""
+        window_alerts.schedule_self_talk(self, after_display=after_display)
+
+    def _on_self_talk_timeout(self) -> None:
+        """周期定时器到点（``window_alerts.on_self_talk_timeout`` host 形转发）。"""
+        window_alerts.on_self_talk_timeout(self)
+
+    def _show_self_talk_text(self, text: str) -> bool:
+        """自言自语文本落地（sprite 版，**不可**直接复用 window_alerts 同名函数）。
+
+        差异点：``window_alerts.show_self_talk_text`` 会
+        ``from .window import _set_speech_bubble_interactive``，而那个实现判的是
+        ``host.on_open_quick_chat``——旧 PetWindow 的快速对话回调名。sprite 壳上
+        叫 ``open_quick_chat``（见 ``_apply_bubble_interactive``），直接复用会把
+        气泡每次置为「不可点」，快速对话入口静默失效。这里改用壳自己的可点态
+        切换，文本交给跟随器，锚点由 follower 自算（气泡锚 sprite 身体框）。
+        """
+        if self._bubble_blocked():
+            return False
+        self._apply_bubble_interactive()
+        return self._show_bubble_text(
+            str(text), int(self._self_talk_duration_seconds * 1000))
+
+    def _show_random_self_talk(self) -> bool:
+        """随机一条自言自语（文本或配图）。
+
+        抽样与出图概率复用 ``window_alerts`` 的纯逻辑函数
+        （``pick_self_talk_choice`` / ``self_talk_image_chance``，无 host 依赖）；
+        落地走 sprite 版气泡面（配图 = 刀 1 的 ``SpriteBubbleFollower.show_image``），
+        不触碰 window 私面。
+        """
+        if self._bubble_blocked():
+            return False
+        # 审批等一直挂着的气泡优先，自言自语不覆盖（window_alerts 同款守卫）
+        if self._sticky_bubble_active or self._alert_current is not None:
+            return False
+        # 惰性剔除运行期间被删除的图片——但 stat 是磁盘税（py-spy 实测
+        # 每次自言自语 timeout 全量 is_file 一遍 = 48-56ms 慢帧），
+        # 60s 才复查一次（配置热改路径会主动重置该时刻）。
+        now = time.monotonic()
+        if now - getattr(self, "_self_talk_images_checked_at", 0.0) > 60.0:
+            self._self_talk_images_checked_at = now
+            live_images = [path for path in self._self_talk_images
+                           if path.is_file()]
+            if len(live_images) != len(self._self_talk_images):
+                self._self_talk_images = live_images
+                # 清单变了：图片缓存按新清单裁剪（decode 在 worker，
+                # 见 _warm_self_talk_images）
+                cache = getattr(self, "_self_talk_image_cache", None)
+                if isinstance(cache, dict):
+                    live_keys = {str(p) for p in live_images}
+                    for key in [k for k in cache if k not in live_keys]:
+                        cache.pop(key, None)
+        picked = window_alerts.pick_self_talk_choice(
+            self._self_talk_texts, self._self_talk_images,
+            window_alerts.self_talk_image_chance(self))
+        if picked is None:
+            return False
+        kind, value = picked
+        duration_ms = int(round(self._self_talk_duration_seconds * 1000))
+        self._apply_bubble_interactive()
+        if kind == "image":
+            # 图片气泡没有可朗读的文本：显式记 None，点击路径据此保持安静
+            self._last_self_talk_text = None
+            follower = getattr(self, "_bubble_follower", None)
+            if follower is None:
+                return False
+            # 只走 worker 预热好的缓存（GUI 同步读图+解码是 100-256ms 慢帧
+            # 源，py-spy 实测）；缓存未命中（decode 在飞/读取失败）这次先
+            # 回退文本，下次命中再出图——绝不在 GUI 线程付磁盘/解码税。
+            cache = getattr(self, "_self_talk_image_cache", {})
+            image = cache.get(str(value))
+            if image is None or image.isNull():
+                self._warm_self_talk_images()
+                if not self._self_talk_texts:
+                    return False
+                self._last_self_talk_text = self._self_talk_texts[0]
+                return self._show_self_talk_text(self._last_self_talk_text)
+            return follower.show_image(
+                value, duration_ms, image_scale=self._self_talk_image_scale,
+                pixmap=QPixmap.fromImage(image))
+        self._last_self_talk_text = value
+        return self._show_self_talk_text(value)
+
+    def _self_talk_gen_now(self) -> int:
+        """当前配图预热换代戳（加载 worker 的作废判据回读口）。"""
+        return getattr(self, "_self_talk_image_warm_gen", 0)
+
+    def _warm_self_talk_images(self, paths=None) -> None:
+        """后台线程解码自言自语配图到 ``_self_talk_image_cache``（QImage，
+        线程安全）；GUI 侧只取缓存。重复调用靠单个守护线程 + 代次去重。
+
+        ``paths`` = 要预热的图片清单（缺省 = 主 sprite 的清单）。缓存按绝对路径
+        共享：不同 sprite 的图片目录不同时天然不串号，相同图只解码一次。
+        """
+        cache = self._ensure_self_talk_image_cache()
+        gen = self._self_talk_image_warm_gen = \
+            getattr(self, "_self_talk_image_warm_gen", 0) + 1
+        source = self._self_talk_images if paths is None else list(paths)
+        self._start_self_talk_image_load(cache, source, gen)
+
+    def _warm_shared_self_talk_images(self, paths) -> None:
+        """预热一组图片到共享缓存，但**不动**代次计数器。
+
+        代次机制只服务"主清单热改 → 作废在飞批次"；子宠 spawn/复活时各自的配图
+        清单预热不该取消主宠在飞的解码（那会让主宠的配图自言自语多等一轮）。
+        失效判定照旧按当前代次：之后主清单换代时这批照样作废。
+        """
+        cache = self._ensure_self_talk_image_cache()
+        self._start_self_talk_image_load(
+            cache, paths, getattr(self, "_self_talk_image_warm_gen", 0))
+
+    def _ensure_self_talk_image_cache(self) -> dict:
+        """配图缓存入口：默认进程级共享表（同池只解一次）；调用方显式设置的
+        独立缓存（测试按需隔离）优先。"""
+        global _SELF_TALK_IMAGE_CACHE_EDGE
+        cache = getattr(self, "_self_talk_image_cache", None)
+        if cache is not None and cache is not _SELF_TALK_IMAGE_CACHE_SHARED:
+            return cache  # 显式独立缓存（测试隔离）：不动共享表
+        edge = self._self_talk_image_cache_edge()
+        if _SELF_TALK_IMAGE_CACHE_EDGE is not None and _SELF_TALK_IMAGE_CACHE_EDGE != edge:
+            _SELF_TALK_IMAGE_CACHE_SHARED.clear()  # 目标长边变了：整表重建
+        _SELF_TALK_IMAGE_CACHE_EDGE = edge
+        self._self_talk_image_cache = _SELF_TALK_IMAGE_CACHE_SHARED
+        return _SELF_TALK_IMAGE_CACHE_SHARED
+
+    def _self_talk_screen_dpr(self) -> float:
+        """当前屏 DPR（配图缓存按物理像素定尺寸；读不到按 1.0）。
+
+        与 ``sprite.set_dpr`` 同源（主宿主的屏），不从 overlay 窗口取——
+        QScreen 只能在 GUI 线程读，而目标尺寸在起解码线程**之前**算好。
+        """
+        screen = self._screen
+        try:
+            return float(screen.devicePixelRatio())
+        except Exception:
+            return 1.0
+
+    def _self_talk_image_cache_edge(self) -> int:
+        """本壳当前配置下的配图缓存目标长边（像素）。"""
+        return self_talk_image_cache_edge(
+            getattr(self, "_self_talk_image_scale", 1.0), self._self_talk_screen_dpr())
+
+    def _self_talk_image_cache_signature(self) -> tuple:
+        """配图缓存签名：(（路径, mtime_ns, size) 清单, 目标长边)。
+
+        清单变了（换目录/加删图/原地替换素材）或显示尺寸变了（配图大小热改、
+        换到不同 DPR 的屏）都必须重建；两者都没变时缓存直接复用——旧实现每次
+        外部配置变更都清空并重新解码全部配图（24 张 36.8MB 的 CPU+IO），
+        而绝大多数 refresh 改的是气泡风格/间隔这类与配图无关的键。
+        """
+        entries = []
+        for path in self._self_talk_images:
+            try:
+                st = path.stat()
+                entries.append((str(path), st.st_mtime_ns, st.st_size))
+            except OSError:
+                entries.append((str(path), 0, 0))  # 读不到：按占位签名参与比对
+        return (tuple(entries), self._self_talk_image_cache_edge())
+
+    def _refresh_self_talk_image_cache_for_dpr(self) -> None:
+        """屏 DPR 变了（换屏/改缩放，不经过配置刷新的那条路）：签名不匹配才重建。
+
+        目标尺寸吃 DPR，签名变了就得按新物理像素重解；DPR 没变时这里只做一次
+        ``devicePixelRatio()`` 比较、连图片清单都不 stat（几何事件可能来得频繁，
+        不能白刷 24 张图）。
+        """
+        sig = getattr(self, "_self_talk_image_cache_sig", None)
+        if sig and sig[1] == self._self_talk_image_cache_edge():
+            return
+        if sig == self._self_talk_image_cache_signature():
+            return
+        _SELF_TALK_IMAGE_CACHE_SHARED.clear()  # 共享表原位清（其他壳仍持同引用）
+        self._self_talk_image_cache = _SELF_TALK_IMAGE_CACHE_SHARED
+        self._self_talk_image_cache_sig = self._self_talk_image_cache_signature()
+        self._self_talk_images_checked_at = time.monotonic()
+        self._warm_self_talk_images()
+
+    def _cancel_self_talk_image_loads(self) -> None:
+        """作废在飞的配图加载批次（stop/退出收口）：换代戳推一格，加载线程
+        在下一张图前自查退出。线程是 ``threading.Thread`` 守护线程，不归 Qt
+        对象树管——壳停了它们还活着，进程退出时原生解码会撞上 Qt 拆除。"""
+        self._self_talk_image_warm_gen = \
+            getattr(self, "_self_talk_image_warm_gen", 0) + 1
+
+    def _start_self_talk_image_load(self, cache, source, gen) -> None:
+        """起一个守护线程把这批图片解码进缓存（空批次不起线程）。"""
+        pending = [str(p) for p in source if str(p) not in cache]
+        if not pending:
+            return
+        # 目标尺寸在 GUI 线程算好（读 QScreen DPR 不能在 worker 里做），
+        # 整批共用——中途换屏/改配图大小由调用方的签名重建接管。
+        edge = self._self_talk_image_cache_edge()
+
+        # 单 worker 加载队列（取代"每批一条守护线程"）：Qt 图片插件并发首用
+        # 会原生崩溃（mac CI 实锤：每个崩点 dump 都有复数加载线程在场），线程
+        # 攒多了又把全局锁挤爆、把活批次的预热饿死（CI 超时实锤）。单线程串行
+        # = 无并发 + 无雪崩；换代戳逐图复查，作废批次零成本跳过。
+        _start_self_talk_loader()
+        _SELF_TALK_LOAD_Q.put((cache, pending, edge, gen, self._self_talk_gen_now))
+
+    def _show_click_self_talk(self, click_name: str = "", sprite=None) -> bool:
+        """点击自言自语（``window_alerts.show_click_self_talk`` host 形转发）。
+
+        可安全转发：该实现只调用 ``host._show_self_talk_text`` /
+        ``host._show_random_self_talk``（本类覆写的 sprite 版 / 子宠宿主版）与
+        ``host.on_self_talk_speak``（朗读通道），自己不做 window 私面 import。
+
+        ``sprite`` = 被点的那一只（B7b）：子宠走它自己的宿主（自己那份台词池/
+        间隔/气泡），主宠仍走壳。
+        """
+        if sprite is None or sprite is getattr(self, "sprite", None):
+            return bool(window_alerts.show_click_self_talk(self, click_name))
+        host = self._self_talk_hosts.get(sprite)
+        if host is None:
+            return False
+        return bool(window_alerts.show_click_self_talk(host, click_name))
+
+    def _on_sprite_click(self, sprite, click_name: str) -> None:
+        """单击 sprite 后的点击分支（``window.py:3370-3377`` 的 sprite 等价物）。
+
+        由 ``ShellOverlayWindow.mouseReleaseEvent`` 注入调用（``click_name`` =
+        本次点击实际绑定的动画名，取不到为 ""）。旧架构一窗一宠：点击音效、余额
+        气泡、点击台词全部落在**被点的那一只**身上（B7b：逐 sprite 取源/落点）。
+        余额优先于自言自语，二者都不开就只发声；自言自语显示成功后按
+        ``after_display`` 重排**它的**周期定时器（避免与刚弹出的点击气泡叠一起）。
+        """
+        target = self.sprite if sprite is None else sprite
+        # 每日一签：当天还没看签时冒一行「今日的签还没看」（服务内部保证一天只提示
+        # 一次、开关关掉就不提示）。挂在这里而不是 click_feedback：后者不带 sprite
+        # 身份、对无 sprite 的调用按契约静音（见下），而且**本方法是壳自己的方法**，
+        # 首次构建与屏迁移两处接线都指向它，不会像 overlay 上的属性那样重挂漏掉。
+        hint = getattr(getattr(self._instance, "shell", None),
+                       "divination_hint_on_interaction", None)
+        if callable(hint):
+            try:
+                hint()
+            except Exception:
+                logging.exception("抽签每日提示失败")
+        # 点击音效：overlay 的 click_feedback 通道不带 sprite 身份（播放器对
+        # "无 sprite"的调用已按契约静音，见 SpriteSoundPlayer.on_click），真正的
+        # 播放落在这一句——门/音量/音源都取被点的那一只自己的配置。通道被置 None
+        # （测试静音 / 无音效后端降级）时整条点击音效关闭。通道取**被点那只所在
+        # 屏**的窗口（点击事件就是从那扇窗来的）。
+        clicked_overlay = self.host_for_sprite(target).overlay
+        if callable(getattr(clicked_overlay, "click_feedback", None)):
+            self._sound.on_click(target)
+        cfg = self._sprite_config(target)
+        if bool(cfg.get("click_show_balance", False)):
+            handler = getattr(getattr(self._instance, "shell", None),
+                              "show_balance", None)
+            if callable(handler):
+                # 余额气泡锚在**被点那一只**的宿主上（主宠 = 壳本身，行为不变）
+                handler(self._sprite_host(target))
+        elif bool(cfg.get("click_show_self_talk", False)):
+            if self._show_click_self_talk(click_name, target):
+                self._schedule_self_talk_for(target, after_display=True)
+
+    # ---- 音乐自动唱歌（M5f：window_alerts host 形函数复用 + 定时器 + 热改）----
+    def _init_music_sing(self) -> None:
+        """音乐检测轮询装配（``window.py:484-490`` 的 sprite 等价物）。
+
+        overlay 拓扑下 PetWindow 不构造，``music_sing_enabled`` 此前零消费。
+        检测/唱歌态/静音宽限期整体复用 ``window_alerts`` 的 host 形函数
+        （``start_music_sing_polling`` / ``check_music_sing``），本壳只补
+        host 面（定时器 + ``_switch`` / ``_is_one_shot_playing`` / 可见性）。
+        构造期与旧机一致：开关开着就先起表（不可见时判定自身早退）。
+        """
+        self._music_sing_enabled = bool(self._config.get("music_sing_enabled", False))
+        self._music_sing_active = False
+        # 唱歌续播判据（window.py:2595-2601）：行为层不查音频，只问这一面；缺它
+        # 则唱歌 clip 播完走掷骰链——约 60% 概率被切到随机动作，唱歌循环碎裂。
+        # 接线点逐宿主一份，在 ``_wire_host``（host.behavior.sing_continue_provider）。
+        self._music_sing_silent_since = None
+        self._instrumental_playing = False
+        timer = QTimer(self)
+        # 1s 轮询：兼顾 COM 开销与「识别到音频后尽快触发」的体验（旧机同值）
+        timer.setInterval(1000)
+        timer.timeout.connect(self._check_music_sing)
+        self._music_sing_timer = timer
+        if self._music_sing_enabled:
+            self._music_sing_timer.start()
+
+    def _check_music_sing(self) -> None:
+        """轮询槽（host 形转发 ``window_alerts.check_music_sing``）。"""
+        window_alerts.check_music_sing(self)
+
+    def _switch(self, name: str) -> None:
+        """``PetWindow._switch`` 的 sprite 等价物（唱歌入口 ``_switch(SING_ANIM)``）。"""
+        self.switch_clip(name)
+
+    def _is_one_shot_playing(self) -> bool:
+        """一次性动作/点击/移动是否在播（window.py ``_is_one_shot_playing`` 等价）。
+
+        检测到音乐时若正在播一次性动作，先不抢绑唱歌（旧机同款守卫）。
+        """
+        return self._link_anim_busy()
+
+    def set_instrumental_playing(self, on: bool) -> None:
+        """纯音乐标志（``window_optional_services.py:130-139`` 的 sprite 等价物）。
+
+        纯音乐没有可唱的句子，``window_alerts.check_music_sing`` 见标志即不唱；
+        置位时同步退出唱歌态，避免"一边关一边开"打架。
+        """
+        self._instrumental_playing = bool(on)
+        if on:
+            self._music_sing_active = False
+            self._music_sing_silent_since = None
+
+    def _stop_music_sing_polling(self) -> None:
+        """隐藏/退出：停轮询（``_pause_activity`` / ``aboutToQuit`` 同语义）。"""
+        timer = getattr(self, "_music_sing_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def sync_music_sing(self) -> None:
+        """按配置（+可见性）启停轮询（window.py:3868-3875 / :1241-1242 口径）。
+
+        - 开关关：停表并清唱歌态；
+        - 开关开且可见：``start_music_sing_polling``（含立即检查一次的 singleShot）；
+        - 开关开但隐藏：保持停止，恢复显示时由 ``set_pet_visible(True)`` 重启。
+        """
+        self._music_sing_enabled = bool(
+            self._config.get("music_sing_enabled", False))
+        timer = getattr(self, "_music_sing_timer", None)
+        if timer is None:
+            return
+        if not self._music_sing_enabled:
+            timer.stop()
+            self._music_sing_active = False
+            self._music_sing_silent_since = None
+            return
+        if self.isVisible():
+            window_alerts.start_music_sing_polling(self)
+
+    # ---- 音乐（歌词）宿主（window_optional_services 四件套的 sprite 等价物）----
+    def install_music_lyric(self):
+        """安装歌词控制器（幂等）。
+
+        overlay 拓扑下 PetWindow 不存在，而右键菜单「音乐」子菜单与设置页
+        ``music_lyric_enabled`` 都需要一个控制器宿主。控制器只消费
+        ``cfg / isVisible / show_bubble / hold_bubble`` 四面，本壳全部具备，
+        故逐行对齐 ``window_optional_services.install_music_lyric``。
+        """
+        if self._music_lyric is None:
+            from .music_lyric_controller import MusicLyricController
+
+            self._music_lyric = MusicLyricController(self)
+        return self._music_lyric
+
+    def sync_music_lyric(self) -> None:
+        """按配置启停歌词显示（不再启用且从未装过 → 不白养定时器）。"""
+        enabled = bool(self._config.get("music_lyric_enabled", False))
+        if not enabled and self._music_lyric is None:
+            return
+        controller = self.install_music_lyric()
+        controller.apply_lead()
+        controller.sync_enabled(enabled)
+
+    def pause_music_lyric(self) -> None:
+        controller = getattr(self, "_music_lyric", None)
+        if controller is not None:
+            controller.pause()
+
+    def shutdown_music_lyric(self) -> None:
+        controller = getattr(self, "_music_lyric", None)
+        if controller is not None:
+            controller.shutdown()
+
+    # ---- 看看屏幕（window.py look_at_screen 的 sprite 等价物）----
+    def look_at_screen(self, sprite=None) -> None:
+        """截屏 → 视觉问答 → 气泡答复（限流口径逐点对齐 window.py）。
+
+        ``sprite`` = 本次识屏的发起者（右键命中的那一只；``None`` = 主 sprite）。
+        旧版一窗一宠，答复气泡天经地义落在被点那只头顶；overlay 下先记住发起者
+        （``_look_sprite``），气泡由 ``_look_bubble`` 分发到**发起者自己的**跟随器
+        （B7b 接上逐 sprite 气泡后，子宠发起的识屏不再让主宠代答）。
+        """
+        target = self.sprite if sprite is None else sprite
+        if target is None or target not in self._all_sprites():
+            return
+        if self._look_busy:
+            self._show_bubble_text_for(target, "上一张还没看完呢…", 3200)
+            return
+        self._look_sprite = target
+        now = time.monotonic()
+        if now - self._last_look_ts < 4.0:
+            self._look_bubble("喘口气嘛，刚看过啦…")
+            return
+        self._last_look_ts = now
+        self._look_busy = True
+        self._look_bubble("让我看看…", 6000)
+        # 主线程解析快照，后台 worker 只做网络/识图（同 window.py 的线程纪律）
+        settings = self._config.chat_settings()
+        provider = copy.copy(settings.active_config)
+        provider.api_key = self._config.resolve_api_key(provider)
+        system_prompt = settings.default_system_prompt
+        # 角色展示名按**发起者**的身份取（子宠可以有自己的角色）
+        pet_name = self._config.character_display_name(str(
+            self._sprite_config(self._look_sprite).get(
+                "character", catalog.DEFAULT_CHARACTER)))
+        threading.Thread(
+            target=self._look_worker,
+            args=(provider, system_prompt, pet_name),
+            daemon=True,
+            name="overlay-look-screen",
+        ).start()
+
+    def _look_worker(self, provider, system_prompt, pet_name: str = "") -> None:
+        from . import vision as vision_mod
+
+        try:
+            shot = vision_mod.capture_screen_bytes()
+            app_info = vision_mod.foreground_app_info()
+            reply = vision_mod.ask_about_screen(
+                shot, app_info, system_prompt, provider, pet_name=pet_name)
+            if shiboken6.isValid(self) is False:
+                return  # 壳已销毁：不再触碰信号
+            user_text = f"[看看屏幕] 前台窗口：{app_info}" if app_info else "[看看屏幕]"
+            self.look_done.emit(reply, user_text, False)
+        except Exception as exc:
+            logging.exception("看看屏幕失败")
+            if shiboken6.isValid(self) is False:
+                return
+            self.look_done.emit(str(exc), "", True)
+
+    def _look_bubble(self, text: str, duration_ms: int = 3200) -> None:
+        """识屏气泡：落**发起者**（``_look_sprite``，右键命中的那一只）头顶。
+
+        旧版一窗一宠，答复气泡天经地义落在被点那只头顶；B7b 接上逐 sprite 气泡
+        后，这里按发起者分发（``_show_bubble_text_for``：主 = 壳，子 = 它自己那只）。
+        飞行期丢弃：这条直写跟随器（不经 ``show_bubble``），不读门禁就会在
+        起飞中照样冒泡——鱼飞行过程中不弹气泡是全局要求。
+        """
+        if self._bubble_blocked(self._look_sprite):
+            return
+        self._show_bubble_text_for(self._look_sprite, text, duration_ms)
+
+    def _on_look_done(self, text: str, user_text: str, is_error: bool) -> None:
+        self._look_busy = False
+        if is_error:
+            self._look_bubble(f"看不清啊…{text[:60]}", 5000)
+            return
+        self._look_bubble(text, max(4000, min(12000, len(text) * 150)))
+        sync = self.on_look_synced
+        if callable(sync):
+            sync(user_text, text)
+
+    # ---- 截图（快速识屏 P0 切片 3：三个产品入口的 sprite 侧接线）----
+    def _screen_capture(self):
+        """三个截图动作的编排件（**本壳长期持有**，菜单对象每次右键重建）。
+
+        等价性：与 ``PetWindow`` 的三个同名入口指向**同一个**编排件实现
+        （``screen_capture.actions``），差别只在宿主面——本壳的 ``_config`` /
+        ``show_bubble`` / ``proactive_watcher`` / ``_instance.shell.island``。
+        采集闭环自己负责隐藏/还原窗口，所以这里不需要逐 sprite 的宿主路由。
+        """
+        from .screen_capture.actions import actions_for
+
+        return actions_for(self)
+
+    @property
+    def on_screen_capture(self):
+        """「截图 → 框选识屏」：采集 → 覆盖层动作条选动作（提取/翻译/问答/复制）。"""
+        return lambda: self._screen_capture().run()
+
+    # ---- 黄金回旋（复用 golden_spin.GoldenSpinController + sprite 宿主）----
+    def _golden_spin_capable(self, sprite) -> bool:
+        """sprite 是否支持整帧旋转通道（假 sprite/替身没有则整族静默降级）。"""
+        return callable(getattr(sprite, "set_throw_rotation", None))
+
+    def _ensure_golden_spin(self, sprite):
+        """懒建控制器（幂等）+ 选定角度目标；**换目标即结清旧的**。
+
+        模型：控制器**全壳共享**（一条角度状态机服务所有宠，与旧架构"一窗一宠"
+        下每窗一台等价），目标**独占**（同一时刻只有一只宠在转）。角度存在各
+        sprite 自己身上，每拍只写给当前目标，故换目标不结清旧的，那只就会永远
+        停在切换那一刻的倾斜角上（归零只发生在控制器对**当前**目标走完最后一圈）。
+        菜单直连与点击直连都经本方法换目标，结清只有这一处。
+        """
+        if not self._golden_spin_capable(sprite):
+            return None
+        spin = self._golden_spin
+        if spin is None:
+            from .golden_spin import GoldenSpinController
+
+            spin = GoldenSpinController(self._golden_spin_host)
+            self._golden_spin = spin
+        if self._golden_spin_target is not sprite:
+            self._settle_golden_spin_target(spin)
+        self._golden_spin_target = sprite
+        return spin
+
+    def _settle_golden_spin_target(self, spin) -> None:
+        """结清当前角度目标：回正旧目标 + 让共享会话回到空闲（换目标前调用）。
+
+        「回正」与控制器走完最后一圈的归零**同一口径**——都经 sprite 的
+        ``set_throw_rotation`` 写 0（0 = 自然角），不走别的通道。顺序固定：先摘
+        目标（此后宿主 ``update`` 找不到目标、不再写角），再 ``cancel`` 收掉共享
+        会话（停表 + 控制器归零 + 清 pending），最后直接回正旧 sprite——"谁写 0"
+        只有一个落点，不依赖 update 的时机。会话结清后 ``start()``/``spin_direct()``
+        对新目标从自然角重新起转（active 拒绝只对**同一目标**的重复触发生效）。
+        """
+        old = self._golden_spin_target
+        self._golden_spin_target = None
+        if old is None:
+            return
+        if spin is not None:
+            spin.cancel()
+        reset = getattr(old, "set_throw_rotation", None)
+        if callable(reset):
+            reset(0.0)
+
+    def _settle_golden_spin_if_target(self, sprite) -> None:
+        """这只 sprite 就是当前回旋目标时先结清——它即将离开窗面（WP11c 相邻缺口）。
+
+        **目标悬空**：被移除的那一只若正是当前目标，它身上的角度就再没人结清了。
+        控制器（``_golden_spin``）是全壳共享的、还活着，宿主每拍仍按
+        ``_golden_spin_target`` 往一只**已经不在窗里**的 sprite 写角——用户看不见，
+        但它会一直写到下一次换目标（或整个会话自然结束）为止，状态挂在一个死对象上。
+        结清口径与换目标那处是**同一份**（:meth:`_settle_golden_spin_target`：
+        置 None → ``cancel`` → 归零；"谁写 0"只有一个落点），故这里只判条件、
+        不重复实现。
+
+        判别放在"移除前"这一侧：结清要写 0 给这只 sprite，写在它还在窗里的时候最
+        直白（此后宿主已经没有目标可写）。
+        """
+        if self._golden_spin_target is sprite:
+            self._settle_golden_spin_target(self._golden_spin)
+
+    def _spin_direct(self, sprite) -> bool:
+        """立即开转（空闲开一圈；旋转中累计一圈并让当前圈快速收尾）。
+
+        语义 = ``GoldenSpinController.spin_direct``（golden_spin.py:75-82）：
+        累计圈数与逐圈加速都在控制器内部，本壳只负责选定目标 sprite。
+        """
+        spin = self._ensure_golden_spin(sprite)
+        if spin is None:
+            return False
+        spin.spin_direct()
+        return True
+
+    def trigger_golden_spin(self, sprite=None) -> None:
+        """右键菜单入口：让**被点的那一只**原地逆时针转一圈（探头/彩蛋在跑时让路）。
+
+        ``sprite=None`` = 主 sprite（兼容既有调用面）。旧 PetWindow「边缘探头激活时
+        不叠加」同纪律；角度状态机/缓动直接复用 ``golden_spin`` /
+        ``window_effects``，杜绝第二套数值。
+        """
+        target = self.sprite if sprite is None else sprite
+        if target is None or not self._golden_spin_capable(target):
+            return
+        host = self.host_for_sprite(target)
+        if getattr(host.probe, "active", False) or host.throw_egg.active:
+            return
+        spin = self._ensure_golden_spin(target)
+        if spin is None:
+            return
+        spin.cancel_pending()
+        spin.start()
+
+    def _route_click_golden_spin(self, sprite) -> bool:
+        """点击触发黄金回旋路由（window_optional_services.py:242-265 的 sprite 版）。
+
+        - 直连模式（``golden_spin_direct``）或角色无点击素材：立即开转并返回
+          True，调用方不再播点击反应/音效（点击已被效果层消费）；
+        - armed 模式（有点击素材且未开直连）：记 pending 并返回 False，点击
+          动画播完后由 ``_on_click_anim_finished`` 接续（旧机同款两段式）。
+        - 开关关 / 探头激活 / sprite 不支持旋转：False（调用方走普通点击链路）。
+        """
+        if getattr(self.host_for_sprite(sprite).probe, "active", False):
+            return False
+        if not bool(self._config.get("golden_spin_on_click", False)):
+            return False
+        if not self._golden_spin_capable(sprite):
+            return False
+        spin = self._ensure_golden_spin(sprite)
+        if spin is None:
+            return False
+        direct = bool(self._config.get("golden_spin_direct", False))
+        has_clips = bool(self._sprite_categories(sprite).get("clicks"))
+        if not direct and has_clips:
+            spin.arm_after_click()
+            return False
+        spin.cancel_pending()
+        spin.spin_direct()
+        return True
+
+    def _on_click_anim_finished(self) -> None:
+        """点击动画自然结束（armed 回旋接续点，window.py:2533-2537 等价物）。"""
+        spin = getattr(self, "_golden_spin", None)
+        if spin is not None:
+            spin.consume_click_finished()
+
+    def _advance_golden_spin(self) -> None:
+        """兼容面（**deprecation**）：同步驱动控制器走一帧。
+
+        M5e 后角度状态机归 ``GoldenSpinController``（16ms 自带 QTimer）；本方法
+        保留给旧调用点/测试手动推进（不等真实时钟）。
+        """
+        spin = getattr(self, "_golden_spin", None)
+        if spin is not None:
+            spin._update(time.monotonic())
+
+    @property
+    def _golden_spin_timer(self):
+        """兼容面（**deprecation**）：控制器内部计时器（无控制器 → None）。"""
+        spin = getattr(self, "_golden_spin", None)
+        return getattr(spin, "_timer", None)
+
+    @property
+    def _golden_spin_started(self) -> float:
+        """兼容面（**deprecation**）：当前圈的起算时刻（控制器私有字段映射）。"""
+        spin = getattr(self, "_golden_spin", None)
+        return float(getattr(spin, "_rev_started_at", 0.0))
+
+    @_golden_spin_started.setter
+    def _golden_spin_started(self, value: float) -> None:
+        spin = getattr(self, "_golden_spin", None)
+        if spin is not None:
+            spin._rev_started_at = float(value)
+
+    # ---- 联动动作（agent_link 的 request_link_* 落点）----
+    def _link_anim_busy(self) -> bool:
+        """一次性动作（动作池/点击/移动）是否在播——联动请求不打断它。"""
+        try:
+            target = self.alert_target_sprite()
+            if target is None:
+                return False
+            return (self.host_for_sprite(target).behavior.state_of(target)
+                    in _LINK_ONESHOT_STATES)
+        except Exception:
+            logging.debug("overlay: 读行为状态失败", exc_info=True)
+            return False
+
+    def switch_clip(self, name: str, link_request: bool = False) -> bool:
+        """播放指定动画（window.switch_clip 语义：一次性，播完回掷骰链）。"""
+        target = self.alert_target_sprite()
+        if target is None or not str(name or ""):
+            return False
+        try:
+            return bool(self.host_for_sprite(target).behavior.play_once(
+                target, str(name)))
+        except Exception:
+            logging.debug("overlay: 切换动画失败 %s", name, exc_info=True)
+            return False
+
+    def request_link_anim(self, name: str) -> None:
+        """Agent 联动动作请求：一次性动作播放中不打断，存为待播（最新覆盖旧的）。"""
+        self.mark_activity()
+        name = str(name or "")
+        if not name:
+            return
+        self._pending_link_anim = name
+        if not self._link_anim_busy():
+            self._play_pending_link_anim()
+
+    def _play_pending_link_anim(self) -> None:
+        name, self._pending_link_anim = self._pending_link_anim, None
+        if not name:
+            return
+        self._link_anim_current = name
+        self.switch_clip(name)
+
+    def request_link_idle(self) -> None:
+        """Agent 回到空闲：取消待播联动；一次性动作让它播完自然回待机。"""
+        self._pending_link_anim = None
+        self._link_anim_current = None
+        if self._link_anim_busy():
+            return
+        idles = self.idles
+        if idles:
+            self.switch_clip(self._pick_idle(idles))
+
+    def _pick_idle(self, idles: list) -> str:
+        rng = getattr(getattr(self, "behavior", None), "rng", None)
+        chooser = getattr(rng, "choice", None)
+        if callable(chooser):
+            try:
+                return str(chooser(list(idles)))
+            except Exception:
+                logging.debug("overlay: 随机待机取素材失败", exc_info=True)
+        return str(idles[0])
+
+    def set_link_next_provider(self, provider) -> None:
+        """注入联动动作链「下一个动作」提供者（``_LinkAnimChain`` 消费）。"""
+        self._link_next_provider = provider
+
+    def clear_pending_link_anim(self) -> None:
+        self._pending_link_anim = None
+
+    def mark_activity(self) -> None:
+        """用户/联动活跃锚点。
+
+        overlay 路径尚无闲置降帧门（D9 未落地项），本方法保留调用面以承接
+        agent_link 的事件语义，等降帧刀落地后在此接真。
+        """
+
+    # ---- 快速对话（气泡可点 → 锚定 sprite 的输入气泡）----
+    def _chat_enabled(self) -> bool:
+        """进程级聊天开关（E2 单源 = AppShell.enable_chat，经 PetInstance 转发）。"""
+        return bool(getattr(self._instance, "enable_chat", True))
+
+    def quick_chat_available(self) -> bool:
+        """快速对话是否可用（未启用聊天 / 无聊天打包变体 → False）。"""
+        return self._quick_chat_class() is not None
+
+    def _quick_chat_class(self):
+        """解析 ``QuickChatBubble``（结果缓存；不可用时 None，**绝不抛**）。
+
+        呈现面纪律：入口探测失败一律降级——气泡/联动链路不能因为一个可选
+        外围模块而中断；真故障仍由 ``_import_quick_chat`` 的 log 暴露。
+        """
+        if not self._chat_enabled():
+            return None
+        if not self._quick_chat_resolved:
+            self._quick_chat_resolved = True
+            try:
+                self._quick_chat_cls = _import_quick_chat()
+            except Exception:
+                logging.exception("overlay: 快速对话模块导入失败，入口静默降级")
+                self._quick_chat_cls = None
+            else:
+                if self._quick_chat_cls is None:
+                    logging.info("overlay: 无聊天变体，快速对话入口静默降级")
+        return self._quick_chat_cls
+
+    def _apply_bubble_interactive(self) -> None:
+        """按快速对话可用性切换气泡可点（旧路径 ``_set_speech_bubble_interactive``）。"""
+        followers = [getattr(self, "_bubble_follower", None), *self._bubble_followers.values()]
+        for follower in followers:
+            if follower is not None:
+                follower.set_interactive(self.quick_chat_available())
+
+    def _on_bubble_clicked(self, sprite) -> None:
+        """气泡主体点击 → 快速对话（``window.py:3419`` 语义：提醒/交互气泡 no-op）。"""
+        if self._sticky_bubble_active or self._alert_current is not None:
+            return
+        self.open_quick_chat(sprite)
+
+    def open_quick_chat(self, sprite=None) -> bool:
+        """打开快速对话输入气泡，锚定被点 sprite；回车发送走既有 chat 链路。
+
+        返回是否真的打开（无聊天变体/构造失败 → False，静默降级）。
+        """
+        cls = self._quick_chat_class()
+        if cls is None:
+            return False
+        target = self.sprite if sprite is None else sprite
+        if target is None or target not in self._all_sprites():
+            return False
+        anchor = _SpriteChatAnchor(self, target)
+        try:
+            bubble = self._quick_chat
+            if bubble is None:
+                bubble = cls(self._sprite_config(self.sprite), pet_window=anchor)
+                bubble.open_chat_callback = self.open_full_chat
+                self._quick_chat = bubble
+            else:
+                bubble.settings = self._config.chat_settings()
+                bubble.refresh_session()
+            bubble.show_for_pet(anchor)
+            return True
+        except Exception:
+            logging.exception("overlay: 打开快速对话失败")
+            return False
+
+    def select_slot(self, slot) -> bool:
+        target = self._sprite_for_slot(slot)
+        self._selected_slot = slot
+        self._selected_sprite = target
+        if target is None:
+            return False
+        self.set_sprite_visible(target, True)
+        self.set_pet_visible(True)
+        # 抬到前面的必须是**这只所在屏**的窗口（多屏下抬主宿主窗口等于抬错屏）
+        overlay = self.host_for_sprite(target).overlay
+        overlay.raise_()
+        overlay.activateWindow()
+        return True
+
+    def open_full_chat(self) -> None:
+        """打开完整聊天窗（快速对话气泡的「全文见聊天窗」入口）。"""
+        opener = getattr(self._instance, "open_chat", None)
+        if not callable(opener):
+            return
+        try:
+            opener()
+        except Exception:
+            logging.exception("overlay: 打开完整聊天窗失败")
+
+    def _close_quick_chat(self) -> None:
+        """收起并释放快速对话气泡（stop/aboutToQuit 收口）。"""
+        bubble, self._quick_chat = self._quick_chat, None
+        if bubble is None:
+            return
+        try:
+            bubble.close()
+        except Exception:
+            logging.debug("overlay: 收起快速对话失败", exc_info=True)
+
+    # ---- 显隐：共享子系统 pause/resume（window.py:1214-1250 语义）----
+    def _pause_shared_subsystems(self) -> None:
+        """隐藏 → proactive.pause + agent_link.pause（岛反馈面可用时不停联动）。
+
+        共享实例（overlay 拓扑恒为 SharedSubsystems）的 ``pause`` 是刻意的
+        no-op——单窗显隐不该停进程级监视器，G1 守卫逐 tick 读 ``isVisible()``
+        拦下截图（限流器状态因此不丢）。本方法保留调用面与 legacy 逐条对齐。
+        """
+        proactive = getattr(self, "proactive_watcher", None)
+        if proactive is not None:
+            try:
+                proactive.pause()
+            except Exception:
+                logging.debug("overlay: 暂停主动识屏失败", exc_info=True)
+        manager = getattr(self, "agent_link_manager", None)
+        if manager is None:
+            return
+        if self._island_feedback_available():
+            return  # 隐藏期间岛是交互面，联动事件仍需驱动岛反馈气泡
+        try:
+            manager.pause()
+        except Exception:
+            logging.debug("overlay: 暂停联动监视器失败", exc_info=True)
+
+    def _resume_shared_subsystems(self) -> None:
+        """恢复显示 → proactive.resume + agent_link.resume（按最新配置重评估）。"""
+        proactive = getattr(self, "proactive_watcher", None)
+        if proactive is not None:
+            try:
+                proactive.resume()
+            except Exception:
+                logging.debug("overlay: 恢复主动识屏失败", exc_info=True)
+        manager = getattr(self, "agent_link_manager", None)
+        if manager is not None:
+            try:
+                manager.resume()
+            except Exception:
+                logging.debug("overlay: 恢复联动监视器失败", exc_info=True)
+
+    def _island_feedback_available(self) -> bool:
+        """岛反馈面是否可用（隐藏期气泡改道 + 联动是否暂停的判定探针）。"""
+        shell = getattr(self._instance, "shell", None)
+        probe = getattr(shell, "_island_feedback_available", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            logging.debug("overlay: 岛反馈面探测失败", exc_info=True)
+            return False
+
+    # ---------------------------------------------------------------- 灵动岛碰撞桥（4.3）
+    def attach_island(self, island) -> None:
+        """岛创建/重建/启停后接线（AppShell._sync_dynamic_island 调用）。
+
+        幂等可重复调；island=None 即摘桥。墙只挂在**岛当前所在那块屏**的碰撞
+        世界与窗口上：岛只有一座，它的局部坐标是那块屏的坐标系，挂到别的屏上
+        会让两块屏的坐标互相污染（主屏的墙去撞副屏同局部坐标的宠）。岛换屏时
+        由 ``_sync_island_host`` 摘旧桥、按新宿主重建。
+
+        ``kinetic`` 接 ``self.driver.note_kinetic``（M-1）：桌宠静止时 tick 已降到
+        T2/T3（不跑仿真），而岛拖拽是几何回调驱动的用户输入、不经过 overlay 的
+        鼠标事件（岛是独立顶层窗）——没有这条通道，快速甩岛过鱼可能整个手势
+        期间一次碰撞结算都没发生。driver 未起（测试宿主/启动早期）时不强接。
+        """
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None:
+            bridge.close()
+            self.island_bridge = None
+        self._island = island
+        if island is None:
+            self._island_host = None
+            return
+        host = self._island_screen_host(island)
+        if host is None:
+            # 岛那块屏上还没有宿主（没有宠就没有窗，也就没有可碰撞的对象）：
+            # 先不挂墙，等那块屏有宠时由 ``_sync_island_host`` 补挂
+            self._island_host = None
+            return
+        driver = getattr(self, "driver", None)
+        kinetic = getattr(driver, "note_kinetic", None)
+        from .island_bridge import IslandWindowBridge
+        self.island_bridge = IslandWindowBridge(
+            island, host.collision, host.overlay, sound=self._sound,
+            kinetic=kinetic if callable(kinetic) else None)
+        self._island_host = host
+
+    def _island_screen_host(self, island):
+        """岛当前所在屏的宿主（那块屏还没有宿主 → None）。
+
+        - **单显示器**（``QGuiApplication.screens()`` 只有一块）：岛与全部宠必在同一
+          块屏上，直接给主宿主（这同时兜住"岛报的屏对象与我们枚举到的不是同一个
+          wrapper"的场合）；
+        - **多显示器**：按岛自己认定的屏（``_current_screen``）取宿主；它认不出来时
+          再用岛窗口几何落在哪块屏判定。那块屏上还没有宠（没有宿主）→ None：那里
+          没有可碰撞的对象，而且**绝不**把墙挂到别的屏的世界里（局部坐标不同源，
+          等于另一块屏上凭空多一堵墙）；那块屏第一次有宠时由 ``_sync_island_host``
+          补挂。
+        """
+        if len(QGuiApplication.screens()) <= 1:
+            return self._main_host
+        screen = None
+        current = getattr(island, "_current_screen", None)
+        if callable(current):
+            try:
+                screen = current()
+            except Exception:
+                screen = None
+        if screen is None:
+            geometry = getattr(island, "geometry", None)
+            rect = None
+            if callable(geometry):
+                try:
+                    rect = geometry()
+                except Exception:
+                    rect = None
+            if rect is not None and not rect.isNull():
+                screen = self._screen_at_global(rect.center())
+        if screen is None:
+            return None
+        return self.host_for_screen(screen)
+
+    def _sync_island_host(self) -> None:
+        """把岛墙对齐到岛当前所在屏的宿主（岛换屏、或那块屏第一次有宠时调）。
+
+        幂等；没有岛时无事。岛那块屏上暂时没有宿主（没有宠/没有窗）就先把桥摘掉，
+        等 ``_create_host`` 给它建出宿主后再挂回来——绝不把墙挂到别的屏的世界里
+        （局部坐标不同源，挂错就是"另一块屏上凭空多一堵墙"）。
+        """
+        island = getattr(self, "_island", None)
+        if island is None:
+            return
+        host = self._island_screen_host(island)
+        if host is getattr(self, "_island_host", None):
+            return
+        if host is None:
+            bridge = getattr(self, "island_bridge", None)
+            if bridge is not None:
+                bridge.close()
+                self.island_bridge = None
+            self._island_host = None
+            return
+        self.attach_island(island)
+
+    # ---------------------------------------------------------------- 生命周期
+    def _warm_sound_effects_once(self) -> None:
+        """首次 start 时预热音效后端（口径 = legacy ``app.py:535-539``）。
+
+        同一预热函数、同一组开关（``click_sound_enabled`` OR
+        ``collision_sound_enabled``）与同一 pack/data_dir：overlay 拓扑没有
+        PetWindow 走 ``_build_window``，缺这段接线时本进程第一次发声要现付
+        winmm ``waveOutOpen`` 冷启动（实测 159.6ms，落在 GUI 事件循环里：
+        ``.scratch/arch-ab/CTL-COLL-SOUND-NEW-10-REPORT.md``）。预热池是进程级
+        的，故只做一次：重 show / stop→start 都不重复；开关都关时不预热，不
+        无谓拉起池。异常纪律同 legacy：预热函数自身已对音频失败静默降级，这里
+        不额外 catch，未知错误照旧抛出（不吞真故障）。
+        """
+        if self._sound_warmed:
+            return
+        self._sound_warmed = True
+        if not (self._config.get("click_sound_enabled", True)
+                or self._config.get("collision_sound_enabled", True)):
+            return
+        click_sound.warm_click_sound_effects(
+            self._config.get("click_sound_pack"),
+            data_dir=getattr(self._config, "dir", None),
+        )
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._stopped = False
+        self._warm_sound_effects_once()  # 首次可见前预热（避免首次发声卡事件循环）
+        self._show_all_hosts()
+        # 构造期复活/生成的 sprite 在窗口可见前被压成暂停（见 _spawn_slot 的
+        # 有效可播判定）：显示后必须补放行，否则子宠永久冻在首帧。逐只被藏起
+        # 的仍在恢复侧被跳过（与整窗显隐同一条判据）。
+        self._set_all_clips_paused(False)
+        self._sync_runtime_marker()  # D7：设置进程避让
+        self.app.installEventFilter(self)  # Esc 全局兜底（弹弓取消）
+        if self.tray is not None:
+            self.tray.show()
+            self._arm_tray_icon_refresh()
+        # 音乐（歌词）：配置开着才装/启（默认关 → 一行不跑，与 legacy 同纪律）
+        self.sync_music_lyric()
+        # M5f：音乐自动唱歌轮询（可见即按开关恢复；隐藏期间保持停止）
+        self.sync_music_sing()
+
+    def _show_all_hosts(self) -> None:
+        """全部宿主窗口显示 + 起播（整组显隐的唯一入口；进程级驱动器共享）。"""
+        for host in self._hosts:
+            host.overlay.show()
+            host.overlay.start()
+
+    def _hide_all_hosts(self) -> None:
+        """全部宿主窗口隐藏（整窗显隐/全屏避让；与 ``_show_all_hosts`` 成对）。"""
+        for host in self._hosts:
+            host.overlay.hide()
+
+    def _any_host_visible(self) -> bool:
+        """是否至少有一张宿主窗口在屏上（整组显隐的判据）。"""
+        return any(host.overlay.isVisible() for host in self._hosts)
+
+    def _stop_all_hosts(self) -> None:
+        """停表（驱动器是进程级的一个表，停任一成员等于停整组——按契约的收口
+        路径只有这里与 ``stop()``）。"""
+        driver = self.driver
+        if driver is not None:
+            driver.stop()
+
+    def _close_all_hosts(self) -> None:
+        """关闭全部宿主窗口（退出收口；逐个 close，单个失败不阻断其余）。"""
+        for host in list(self._hosts):
+            try:
+                host.overlay.close()
+            except RuntimeError:
+                continue
+            except Exception:
+                logging.exception("overlay: 关闭宿主窗口失败")
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt 命名)
+        """应用级 Esc 兜底：overlay 是防抢焦点窗（WS_EX_NOACTIVATE），
+        keyPressEvent 只在确有焦点时收到 Esc；弹弓瞄准中按 Esc 全局取消。
+
+        F-PERF 快路径：本过滤器注册在 QApplication 上（``start()`` 的
+        ``installEventFilter``），110Hz 重绘 + 定时器 + 输入让它每秒被调用
+        数千次（实机 py-spy：GUI 线程 9.4%），而其中只有「KeyPress + Esc +
+        正在瞄准」这条路要动手。故：
+
+        - 非 KeyPress 第一行直接 ``return False``——不构造 ``super()`` 的
+          C++ 往返（``QObject.eventFilter`` 基类实现恒返回 False，Qt 文档
+          明载 "The default implementation always returns false"，故语义
+          逐位等价，见 tests/test_overlay_shell_event_filter.py）；
+        - 不消费的 KeyPress 同样就地返回 False；
+        - 消费分支（瞄准中 Esc）逐位保留原行为：取消会话 + 返回 True 吞掉
+          事件。
+
+        另有一条**岛换屏**的窄分支（多屏）：岛拖到另一块显示器上时把它的碰撞墙
+        移交给那块屏的宿主。岛自己的 ``on_geometry_changed`` 单槽已被岛桥占用，
+        故借本过滤器（本就挂在应用上）看它的 Move，不新起定时器/不进 tick。
+        """
+        if event.type() == QEvent.Type.Move and watched is getattr(self, "_island", None):
+            self._sync_island_host()
+            return False
+        if event.type() != QEvent.Type.KeyPress:
+            return False
+        if event.key() != Qt.Key.Key_Escape:
+            return False
+        overlay = getattr(self, "overlay", None)
+        if overlay is not None and overlay.slingshot.aiming:
+            overlay._cancel_slingshot(resume_drag=False)
+            return True
+        return False
+
+    def _run_exit_step(self, label: str, step) -> None:
+        """退出收口的一步一隔离（缺陷 13）：单步异常只记日志，不中断后续步骤。
+
+        ``stop()`` / ``_on_about_to_quit()`` 原是一条裸调用链——靠前的可抛步骤
+        （``shutdown_music_lyric`` 内部是无守卫的 ``timer.stop()`` / ``bridge.close()``
+        / ``overlay.stop()``）一旦抛错，位置持久化与在飞供给取消就被整体跳过：
+        配置不落盘、在飞帧序列线程无人取消（库随壳析构活线程 = Qt fatal）。
+        """
+        try:
+            step()
+        except Exception:
+            logging.exception("overlay: 退出收口步骤失败（%s）", label)
+
+    def _shutdown_library(self, lib, label) -> None:
+        """显式关闭一个素材库（缺陷 14：主库与子宠库同一收口）。
+
+        ``MovieLibrary.shutdown`` 自带幂等与内部收口（``pause_warm`` + 预热责任
+        交接 + 在飞供给取消 + 逐个 clip 的 ``close``/``stop``）；库没有
+        ``shutdown`` 面时退回只停预热（旧行为）。单库失败不阻断其余收口。
+        """
+        if lib is None:
+            return
+        shutdown = getattr(lib, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+                return
+            except Exception:
+                logging.exception("overlay: 退出时素材库收尾失败 (label=%r)", label)
+        pause = getattr(lib, "pause_warm", None)
+        if callable(pause):
+            try:
+                pause()
+            except Exception:
+                logging.exception("overlay: 退出时暂停预热失败 (label=%r)", label)
+
+    def _shutdown_libraries(self) -> None:
+        """关闭主库与全部子宠库（两处退出路径同一口径，缺陷 14）。"""
+        self._shutdown_library(getattr(self, "lib", None), "主肥鱼")
+        for sprite, lib in list(getattr(self, "_spawned_libs", {}).items()):
+            self._shutdown_library(lib, sprite)
+
+    def _close_bubble_followers(self) -> None:
+        """收掉气泡跟随器（主气泡 + 逐 sprite 的子气泡）。
+
+        单只跟随器收尾失败不阻断其余（逐对象容错口径同
+        ``_cancel_frameseq_provisions``）。
+        """
+        follower = getattr(self, "_bubble_follower", None)
+        if follower is not None:
+            follower.close()
+        for follower in list(self._bubble_followers.values()):
+            try:
+                follower.close()
+            except Exception:
+                logging.debug("overlay: 停机时子宠气泡收尾失败", exc_info=True)
+        self._bubble_followers = {}
+
+    # ---------------------------------------------------------------- 测试收口
+    @classmethod
+    def _shutdown_live_for_tests(cls) -> None:
+        """逐测试收口所有活跃壳（conftest 防线；MovieLibrary 同范式）。
+
+        壳把 tick 驱动器、自言自语计时、监视器、配图加载线程与素材库带进共享
+        QApplication；测试不收口就漂到后续用例与进程退出（全量套件/macOS CI
+        的漂移段错误累积源）。逐壳 ``stop()``（幂等、逐步隔离），未 start 的
+        壳靠外层顶层窗口清扫回收。
+        """
+        for shell in list(_LIVE_OVERLAY_SHELLS):
+            try:
+                shell.stop()
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "测试收口 OverlayShell 失败", exc_info=True)
+            # stop() 对未 start 的壳早退——但它们的配图预热批次照样在加载队列里
+            # 排队，不戳换代戳就会整批解完（队列积压把活批次的预热饿死，CI 实测
+            # 超时）。收口时无条件作废在飞批次。
+            try:
+                shell._cancel_self_talk_image_loads()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        """幂等：重复 stop 是 no-op。
+
+        退出收口逐步隔离（缺陷 13）：每一步独立 try/except，单步抛错只记日志。
+        """
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
+        self._started = False
+        recovery = getattr(self, "_recovery_window", None)
+        if recovery is not None:
+            recovery.close()
+        self._run_exit_step('移除应用级事件过滤器',
+                            lambda: self.app.removeEventFilter(self))
+        timer = getattr(self, "_self_talk_timer", None)
+        if timer is not None:
+            # M9：stop 后不再自我重排（引用环也让壳可被回收）
+            self._run_exit_step('停自我重排定时器', timer.stop)
+        # B7b：子宠各自的计时同样停表
+        self._run_exit_step('停止子宠自言自语计时', self._stop_all_self_talk_hosts)
+        self._run_exit_step('摘设置命令监听', self._teardown_settings_command_watch)
+        # 配图加载守护线程不归 Qt 管（threading.Thread）：换代戳推一格，在飞
+        # 批次下一张图前自查作废——否则壳已停、线程还在往壳的缓存里写，进程
+        # 退出窗口里就是原生解码撞上对象拆除（macOS CI 三连崩的实锤形态之一）。
+        self._run_exit_step('作废在飞配图加载', self._cancel_self_talk_image_loads)
+        self._run_exit_step('关闭歌词控制器', self.shutdown_music_lyric)
+        self._run_exit_step('停音乐唱歌轮询', self._stop_music_sing_polling)
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None:
+            self._run_exit_step('关闭灵动岛桥', bridge.close)
+            self.island_bridge = None
+        self._run_exit_step('停止可见性监视器', self._watcher.stop)
+        self._run_exit_step('删除运行标记', self._delete_runtime_marker)
+        self._run_exit_step('关闭快速对话', self._close_quick_chat)
+        self._run_exit_step('收掉气泡跟随器', self._close_bubble_followers)
+        self._run_exit_step('停 overlay 驱动', self._stop_all_hosts)
+        self._run_exit_step('关闭 overlay 窗口', self._close_all_hosts)
+        if self.tray is not None:
+            self._run_exit_step('隐藏托盘图标', self.tray.hide)
+        # F3 + 缺陷 14：在飞帧序列供给线程与素材库（主库 + 子宠库）的收口（口径
+        # 同 _on_about_to_quit / _on_session_end）。缺这两步时库不 shutdown，而
+        # 库里活着的供给 QThread 是库的子对象——库随壳销毁会把活线程一起析构
+        # （Qt fatal，见 _on_about_to_quit 的说明）。
+        self._run_exit_step('取消在飞帧序列供给', self._cancel_frameseq_provisions)
+        self._shutdown_libraries()
+
+    def _on_about_to_quit(self) -> None:
+        """退出收口：停 tick + 暂停预热 + 监视器与避让标记清理（4.1b）。
+
+        逐步隔离（缺陷 13）：每一步独立 try/except，前置步骤抛错不得让**必做项**
+        （窗口位置落盘 / 子宠位置落盘 / 在飞供给取消）被整体跳过。
+        """
+        self._run_exit_step('停止可见性监视器', self._watcher.stop)
+        watcher = getattr(self, "_session_watcher", None)
+        unregister = getattr(watcher, "unregister_session_notifications", None)
+        if callable(unregister):
+            # 锁屏通知注册与窗口句柄同生共死（O4）
+            self._run_exit_step('反注册锁屏通知', unregister)
+        # Qt 的过滤器表只存裸指针：退出时必须摘掉，绝不给它留一个即将析构的对象
+        uninstall = getattr(watcher, "uninstall", None)
+        if callable(uninstall):
+            self._run_exit_step('摘除会话结束原生过滤器', uninstall)
+        self._run_exit_step('摘设置命令监听', self._teardown_settings_command_watch)
+        self._run_exit_step('删除运行标记', self._delete_runtime_marker)
+        self._run_exit_step('关闭快速对话', self._close_quick_chat)
+        self._run_exit_step('关闭歌词控制器', self.shutdown_music_lyric)
+        self._run_exit_step('停音乐唱歌轮询', self._stop_music_sing_polling)
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None:
+            self._run_exit_step('关闭灵动岛桥', bridge.close)
+            self.island_bridge = None
+        # 4.2a：退出持久化（rx/ry/facing/scale）+ 4.2b：子肥鱼逐只按 slot 身份持久化
+        self._run_exit_step('持久化窗口位置', self.save_position)
+        self._run_exit_step('持久化子宠位置', self.save_spawned_positions)
+        self._run_exit_step('停 overlay 驱动', self._stop_all_hosts)
+        # 主库显式 shutdown（缺陷 14）：shutdown 内部已含 pause_warm 与在飞供给
+        # 取消；无 shutdown 面的库退回只停预热（旧行为）。
+        self._shutdown_library(getattr(self, "lib", None), "主肥鱼")
+        # 首跑供给线程不是预热线程：``pause_warm`` 管不到它，而它自己派生转换
+        # ffmpeg（issue #111 的关机/退出窗口里最不该有的派生），库随本壳销毁时
+        # 活线程还会被一起析构（Qt fatal）。逐库显式取消（口径同 _on_session_end
+        # 的逐库 stop_all_clips）。
+        self._run_exit_step('取消在飞帧序列供给', self._cancel_frameseq_provisions)
+
+    def _cancel_frameseq_provisions(self) -> None:
+        """取消本路径各库的在飞帧序列供给线程（退出/会话结束收口，issue #111）。
+
+        每只子肥鱼各持独立库（M8），故逐个来；单库取消失败（半销毁/已收尾）不得
+        阻断其余库，与 ``_on_session_end`` 的逐库收口同口径。库侧自带失效语义
+        （幂等 + 有界等待 + 超时孤儿兜底，见
+        ``MovieLibrary.cancel_frameseq_provision``），这里只负责遍历。
+        """
+        libs = [self.lib] + [lib for lib in getattr(self, "_spawned_libs", {}).values()]
+        for lib in libs:
+            cancel = getattr(lib, "cancel_frameseq_provision", None)
+            if not callable(cancel):
+                continue
+            try:
+                cancel()
+            except Exception:
+                logging.exception("overlay: 取消帧序列供给线程失败")
+
+    # ---------------------------------------------------------------- 托盘（多宠聚合）
+    def _build_tray(self) -> None:
+        """建单托盘 + 双击显隐；菜单本体交给 ``_refresh_tray_menu`` 聚合重建。
+
+        对齐 legacy（app.py:3171-3309）：进程级**单**托盘，多宠时逐只子菜单；
+        图标/双击接线只做一次，菜单随生灭刷新（托盘菜单是快照，不重建会把已
+        退出的身份留在菜单里）。
+
+        ``try`` 只包托盘构造本身（疑似缺口 C）：建菜单阶段任何异常都只记日志，
+        已建好的托盘照常 ``show()``——菜单失败不该让用户「托盘里完全没有条目」。
+        """
+        try:
+            tray = QSystemTrayIcon(self._tray_icon(), self)
+        except Exception:
+            logging.exception("overlay: 创建托盘失败")
+            self.tray = None
+            self._ensure_recovery_entry(force=True)
+            return
+        tray.activated.connect(
+            lambda reason: self._toggle_pet_visible()
+            if reason == QSystemTrayIcon.ActivationReason.DoubleClick
+            else None)
+        tray.setToolTip("dsh-pet (overlay)")
+        # 菜单本体强引用保活（app.py F5 教训：PySide6 wrapper 回收后
+        # contextMenu 会命中失效 wrapper）
+        self.tray = tray
+        try:
+            self._refresh_tray_menu()
+        except Exception:
+            logging.exception("overlay: 重建托盘菜单失败（托盘保留）")
+        self._ensure_recovery_entry()
+
+    def announce_slot0_profile_problem(self, diagnosis: str) -> bool:
+        """把 slot0 档案降级的诊断说给用户（含路径与显式恢复入口）。
+
+        返回是否真的上了屏。**只陈述与指路**：不代用户生成、不碰坏档案（原文件保留）。
+        存放一份供恢复窗/托盘提示复用——无托盘的恢复窗是此时唯一的可见入口。
+        """
+        self._slot0_profile_diagnosis = str(diagnosis)
+        label = getattr(self, "_recovery_diagnosis_label", None)
+        if label is not None:
+            try:
+                label.setText(str(diagnosis))
+                # 标签恒建（见 ``_ensure_recovery_entry``）：先建窗后出事时它是隐藏的，
+                # 补文案必须一起放出来，否则恢复窗开着却一句解释都没有。
+                label.setVisible(True)
+            except RuntimeError:
+                pass
+        text = f"{diagnosis}\n可用托盘/恢复窗的「生成 / 恢复 slot0」再试。"
+        if self.show_bubble(text, duration_ms=9000):
+            return True
+        return False
+
+    def slot0_profile_diagnosis(self) -> str:
+        """slot0 降级诊断（空串 = 正常）；供托盘 tooltip / 恢复窗展示。"""
+        own = str(getattr(self, "_slot0_profile_diagnosis", "") or "")
+        if own:
+            return own
+        shell = getattr(self._instance, "shell", None)
+        reader = getattr(shell, "slot0_profile_diagnosis", None)
+        if callable(reader):
+            try:
+                return str(reader() or "")
+            except Exception:
+                logging.debug("overlay: 读取 slot0 降级诊断失败", exc_info=True)
+        return ""
+
+    def _ensure_recovery_entry(self, force=False):
+        if not force and QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        from PySide6.QtWidgets import QLabel, QWidget, QVBoxLayout, QPushButton
+
+        recovery = getattr(self, "_recovery_window", None)
+        if recovery is None:
+            recovery = QWidget()
+            recovery.setWindowTitle("桌宠恢复")
+            layout = QVBoxLayout(recovery)
+            # 诊断标签**恒建**（空文本时隐藏）：无托盘时这里是唯一可见入口，坏档案的
+            # 事实与路径必须在这里说清楚（否则用户只看到"主桌宠不见了"）；运行期再
+            # 出的事故（生成失败等）也复用同一个标签，见 ``_show_recovery_diagnosis``。
+            note = QLabel(self.slot0_profile_diagnosis())
+            note.setWordWrap(True)
+            note.setObjectName("recoveryDiagnosis")
+            note.setVisible(bool(note.text()))
+            layout.addWidget(note)
+            self._recovery_diagnosis_label = note
+            for label, callback in (("生成 / 恢复桌宠", self.spawn_pet),
+                                    ("打开配置目录", self.open_config_dir),
+                                    ("slot0 设置", self.open_settings_for),
+                                    ("退出应用", self.app.quit)):
+                button = QPushButton(label)
+                button.clicked.connect(callback)
+                layout.addWidget(button)
+            self._recovery_window = recovery
+        recovery.show()
+
+    def open_config_dir(self, *_ignored) -> bool:
+        """打开 config 目录（恢复窗的"去修档案"入口，2026-10-10 ops D2-新）。
+
+        本批次不做自动修复，也不代用户备份/重建坏档案（规范："不覆盖、不自动修复"），
+        所以能给的补偿是**把路指清楚**：说明里点名文件路径，这里把它所在的目录打开，
+        用户自己用编辑器改回去。返回是否真的交出去了（取不到目录/系统不认 = False）。
+        """
+        config_dir = self._spawn_config_dir() or getattr(self._config, "dir", None)
+        if config_dir is None:
+            logging.warning("overlay: 打开配置目录失败（取不到 config 目录）")
+            return False
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        opened = bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(config_dir))))
+        if not opened:
+            logging.warning("overlay: 打开配置目录失败：%s", config_dir)
+        return opened
+
+    def _refresh_tray_menu(self) -> None:
+        """重建聚合托盘菜单：进程级动作 + 逐只子菜单（legacy 单托盘多窗语义）。
+
+        逐条对照 legacy（app.py:3203-3301，见 PR 报告）：
+        - 顶层「显示 / 隐藏」「回到右下角」= legacy 主窗两项（overlay 单窗，
+          显隐天然覆盖全部 sprite）；
+        - 「生小肥鱼 / 退出子肥鱼」= overlay 多宠生命周期入口（legacy 在右键
+          菜单/设置页，不重复造第二个实现，直接复用壳的两个公开方法）；
+        - **只要 ≥1 只**就有逐只子菜单「主肥鱼 / 小肥鱼 [slot-N]」= legacy 每窗
+          子菜单，含「回到右下角」「退出这只」（见 :meth:`_exit_pet_from_tray`）；
+          「显示这只」（per-sprite visible，M14）只在 ≥2 只时挂——逐只显隐回答的
+          是"这几只里藏哪只"，只剩一只时顶层「显示 / 隐藏」已经按整窗语义给过；
+          顶层「显示 / 隐藏」仍是整窗语义（overlay 单窗，全显全隐）。
+          **单宠也必须挂**：关闭宠物 ≠ 退出应用（规范 §一/§四），只在 ≥2 只时
+          才建逐只菜单，等于让单宠用户的"关闭"只剩顶层「退出」（= 退出整个应用）
+          一条路——实测发现时就是这样（见 .scratch/product-close-approved-gui-
+          20261011/REPORT.md §5）。0 只时不建（没有"这只"可指，也就不会有
+          指向 None 的条目）；恢复入口是下面那条「生成 / 恢复 slot0」；
+        - 「桌宠设置」按主身份路由（D13）、「退出」= app.quit；
+        - 「鼠标穿透」「开机自启」= legacy 托盘后段两项（穿透只有托盘/设置页能取消；
+          自启勾选态按系统登录项实况，弹出前同步）。
+
+        **派发契约**（与 legacy 托盘 `3356d67` 同口径）：会动窗面/冒泡/系统登录项
+        的条目一律走 ``add_tray_action`` / ``add_tray_toggle``——菜单先关，回调延到
+        菜单真的不在之后再执行。macOS 的托盘菜单是 AppKit 原生 NSMenu 跟踪会话，
+        会话中新建/激活窗口会被抑制（issue #4 家族：点了没反应）；勾选项的副作用
+        挂 ``triggered`` 而不是 ``toggled``，弹出前那次程序化 ``setChecked`` 就不会
+        顺手重写配置/登录项。本壳是 overlay 拓扑下用户**实际看到**的托盘。
+        """
+        if self.tray is None:
+            return
+
+        def add_tray_toggle(target: QMenu, label: str, checked, apply):
+            """可勾选托盘条目：勾选态即时翻转，副作用延到菜单关闭后执行。
+
+            与 ``app.py::_build_tray`` 的同型助手逐位一致（那里是嵌套函数，导不出来）。
+            ``add_tray_action`` 的回调在菜单关闭后执行，此时 ``isChecked()`` 已是用户
+            点出来的最终值——故 apply 收勾选态，而不是在连接时把它绑死。
+            """
+            action = add_tray_action(
+                target, label, lambda: apply(bool(action.isChecked())))
+            action.setCheckable(True)
+            action.setChecked(bool(checked))
+            return action
+
+        menu = QMenu()
+        # 气泡是置顶 Tool 窗口（层级高于菜单）：弹出前先隐藏（legacy 同款）
+        menu.aboutToShow.connect(self._hide_bubble_for_menu)
+        # 弹出前同步逐只勾选态（外部改过 sprite.visible 也能反映）
+        menu.aboutToShow.connect(self._sync_tray_pet_visibility)
+        # 本段无一条是纯记账：显隐要动合成窗、归位要动 sprite 位置、生/退桌宠要动
+        # sprite 与各自库（还可能冒泡），全按上面的派发契约走。
+        add_tray_action(menu, "显示 / 隐藏", self._toggle_pet_visible)
+        add_tray_action(menu, "回到右下角",
+                        lambda: self._go_default_corner(self.sprite))
+        menu.addSeparator()
+        add_tray_action(menu, "生成 / 恢复 slot0（档案损坏，见日志）"
+                        if self.slot0_profile_diagnosis() and self.sprite is None
+                        else ("生成 / 恢复 slot0" if self.sprite is None else "生小肥鱼"),
+                        self.spawn_pet)
+        add_tray_action(menu, "退出子肥鱼", self.clear_spawned_pets)
+        # tooltip 默认不显示（QMenu 的默认值），而这条关闭入口的 tooltip 正是
+        # "档案还在、怎么弄回来"的说明，必须能看见。
+        menu.setToolTipsVisible(True)
+        visible_actions: list = []
+        entries = self._pet_entries()
+        if entries:
+            menu.addSeparator()
+            # 逐只显隐只在"≥2 只"时有意义：它回答的是"这几只里藏哪只"。只剩一只时
+            # 藏它 = 整窗没有内容可画，而那条路顶层「显示 / 隐藏」已经按整窗语义
+            # 给过了（拆成"藏这一只"只会多出一个等价但更弱的状态，且主宠即宿主
+            # 合成窗——SpriteMenuFacade.hide() 记的正是这个口径）。
+            # 关闭入口不受此限：单宠缺的从来不是显隐，而是"关掉它但别退出应用"。
+            per_pet_visibility = len(entries) > 1
+            for sprite, label in entries:
+                # 子菜单也是同一个原生跟踪会话的一部分，会话中做这些同样会被抑制：
+                # 子项与顶层同族（同一批窗面/显隐状态），一律延迟派发。
+                # 关闭观测目标由 ``add_tray_action`` 统一取整棵树（``shared._menu_tree``）：
+                # 子菜单关掉 ≠ 会话结束，根菜单还开着就还在同一次原生跟踪里。
+                sub = menu.addMenu(label)
+                add_tray_action(sub, "回到右下角",
+                                lambda s=sprite: self._go_default_corner(s))
+                if per_pet_visibility:
+                    toggle = add_tray_toggle(
+                        sub, "显示这只", self._sprite_visible(sprite),
+                        lambda want, s=sprite: self.set_sprite_visible(s, want))
+                    visible_actions.append((sprite, toggle))
+                close = add_tray_action(sub, "退出这只",
+                                        lambda s=sprite: self._exit_pet_from_tray(s))
+                close.setToolTip(
+                    "关闭这只桌宠：档案与位置保留，可用托盘「生成 / 恢复 slot0」再恢复；"
+                    "不退出应用。"
+                    if sprite is self.sprite else
+                    "关闭这只桌宠：它自己的档案保留，可用托盘「生小肥鱼」再生成；"
+                    "不影响其它桌宠。")
+        self._pet_visible_actions = visible_actions
+        menu.addSeparator()
+        # 与 legacy 托盘同口径：菜单先关、回调延到菜单关闭后执行（原生菜单跟踪
+        # 会话里开窗/冒泡会被 AppKit 抑制，见 shared.run_after_menu_closed）。
+        add_tray_action(menu, "桌宠设置",
+                        lambda: self.open_settings_for(self.sprite))
+        # legacy 托盘两项（app.py:3333-3343）：鼠标穿透的取消入口只有托盘/设置页，
+        # 开着时桌宠点不动；开机自启此前只有右键菜单有勾选项。两项都写配置、写系统
+        # 登录项，按派发契约走勾选版助手。
+        mouse_through = add_tray_toggle(
+            menu, "鼠标穿透", bool(self._config.get("mouse_through", False)),
+            self._on_user_through_changed)
+        menu.addSeparator()
+        autostart = add_tray_toggle(
+            menu, "开机自启", self._autostart_enabled(), self._set_autostart_from_tray)
+        # 弹出前同步勾选态（设置页/右键菜单改过的不刷新会过期，legacy 同款）。
+        # 只改看相、不触发副作用：副作用挂 triggered，程序化 setChecked 不发它。
+        menu.aboutToShow.connect(
+            lambda: self._sync_tray_toggle_checks(mouse_through, autostart))
+        menu.addSeparator()
+        # 「退出」刻意不延迟：它不是窗面动作，而是结束本进程（会话中被抑制的对象
+        # 在退出路径上不存在），legacy 托盘同样是裸 addAction——两边同判断。
+        menu.addAction("退出", self.app.quit)
+        old = self._tray_menu
+        self.tray.setContextMenu(menu)  # 新菜单先接管，旧菜单才允许释放（F5）
+        self._tray_menu = menu
+        # QAction wrapper 一并保活：子菜单的 menuAction 挂在父菜单 actions 里，
+        # wrapper 被回收会让整棵菜单被 PySide6 判为已删除（app.py:3319 同因）
+        snapshot = list(menu.actions())
+        for act in list(snapshot):
+            sub = act.menu()
+            if sub is not None:
+                snapshot.extend(sub.actions())
+        self._tray_actions = snapshot
+        if old is not None and old is not menu:
+            old.deleteLater()
+
+    def _autostart_enabled(self) -> bool:
+        """系统当前是否已注册开机自启（legacy ``autostart_mod.is_enabled()`` 口径）。"""
+        try:
+            return bool(autostart_mod.is_enabled())
+        except Exception:
+            logging.debug("overlay: 读取开机自启状态失败", exc_info=True)
+            return False
+
+    def _set_autostart_from_tray(self, enabled: bool) -> None:
+        """托盘「开机自启」→ 实例的 ``_set_autostart(enabled, 壳)``。
+
+        写系统登录项的实现在 AppShell（``app.py:_set_autostart``，覆盖三平台），
+        壳只做转发：失败时它用 ``win.show_bubble`` 提示，overlay 下 ``win`` 就是
+        本壳（具 ``show_bubble`` 宿主面）。取不到该方法（测试替身/精简装配）时
+        静默降级，绝不因托盘一项拖垮菜单。
+        """
+        setter = getattr(self._instance, "_set_autostart", None)
+        if not callable(setter):
+            logging.debug("overlay: 实例无 _set_autostart，托盘项跳过")
+            return
+        try:
+            setter(bool(enabled), self)
+        except Exception:
+            logging.exception("overlay: 托盘写入开机自启失败")
+
+    def _sync_tray_toggle_checks(self, mouse_through, autostart) -> None:
+        """托盘弹出前同步两个勾选项（legacy ``sync_tray_checks`` 口径）。
+
+        设置页/右键菜单改过的开关若不刷新，托盘里的勾选态会过期（用户会以为
+        「点了没反应」）。
+        """
+        pairs = ((mouse_through, bool(self._config.get("mouse_through", False))),
+                 (autostart, self._autostart_enabled()))
+        for action, value in pairs:
+            try:
+                action.setChecked(bool(value))
+            except RuntimeError:
+                continue  # 菜单已销毁（wrapper 失效）：跳过
+
+    def _pet_entries(self) -> list:
+        """托盘逐只条目：(sprite, 标签)。主宠在前 = 活跃清单列表头口径。"""
+        entries = [(self.sprite, "主肥鱼 [slot-0]")] if self.sprite is not None else []
+        for sprite in self._spawned:
+            slot = self._spawned_slots.get(sprite)
+            label = f"小肥鱼 [slot-{slot}]" if slot is not None else "小肥鱼"
+            entries.append((sprite, label))
+        return entries
+
+    def _exit_pet_from_tray(self, sprite) -> None:
+        """菜单关闭后按捕获sprite走同一可逆关闭契约；过期目标为空操作。"""
+        from .sprite_menu_facade import SpriteMenuFacade
+
+        SpriteMenuFacade(self, sprite).on_exit_pet()
+
+    def _go_default_corner(self, sprite) -> None:
+        """把指定 sprite 送回右下角（window.go_default_corner 等价）。
+
+        落位前先取消该 sprite 的探头会话（legacy ``window._go_default_corner`` 同
+        语义）。会话残留时：角色保持 ±45° 探头姿态停在右下角，且下一次点击触发的
+        拉直过渡会把 x 写回**旧屏缘**（``_apply_pose`` 的 ``probe_target_x``）——
+        表现为「点一下瞬移回原来贴的那条边」。托盘主宠/子宠与设置重置三个入口都走
+        本方法，故一处收口即同惠。
+        """
+        host = self.host_for_sprite(sprite)
+        if getattr(host.probe, "active", False):
+            host.probe.cancel(sprite, "return_corner")
+        sprite.set_pos(self._default_corner_pos(host.bounds, sprite.rect()))
+
+    def _hide_bubble_for_menu(self) -> None:
+        """托盘菜单弹出前隐藏气泡（legacy menu.aboutToShow → hide_speech_bubble）。
+
+        气泡是置顶 Tool 窗口，**每只 sprite 各一只**（B7b），故逐只收起。
+        """
+        followers = [getattr(self, "_bubble_follower", None)]
+        followers.extend(list(self._bubble_followers.values()))
+        for follower in followers:
+            if follower is not None:
+                follower.hide()
+
+    def _tray_placeholder_icon(self):
+        """首帧未就绪时的托盘占位图标 = legacy 同款宠物爪印（app.py:3127）。
+
+        不用系统 ``SP_ComputerIcon``：首帧未就绪期间（首跑转码/慢启动）用户在
+        托盘里看到的会是「电脑」图标而不是桌宠图标，观感等同「托盘栏里没有
+        桌宠图标」。刻意不传本壳当主题色宿主——托盘观感与窗口 QSS 无关
+        （legacy ``_tray_placeholder_icon`` 同款口径）。
+        """
+        from .context_menus.icons import vector_menu_icon
+        return vector_menu_icon(QWidget(), "pet", 64)
+
+    def _tray_icon(self):
+        """托盘图标取鱼本体当前帧（idle 首帧兜底）；取不到回退爪印占位图标。"""
+        pm = self.icon_pixmap(64)
+        if pm is not None:
+            return QIcon(pm)
+        return self._tray_placeholder_icon()
+
+    def _arm_tray_icon_refresh(self) -> None:
+        """首帧就绪后把托盘图标从占位换成角色头像。
+
+        legacy 同款修复（app.py:3132-3148：占位图标 + frame_ready 换头像）的
+        sprite 壳等价物——sprite 没有 frame_ready 信号，用 500ms 短轮询。
+        必须有这一步：托盘图标只在建造时取一次，而 ``_build_tray`` 跑在
+        ``overlay.show()`` 之前，此刻 sprite 首帧尚未上屏、clip 也未起播，
+        ``icon_pixmap`` 只能回退系统占位图标，不刷新就永远显示不出鱼。
+        """
+        if self.tray is None:
+            return
+        if self._refresh_tray_icon_once():
+            return
+        self._tray_icon_retries = 0
+        timer = QTimer(self)
+        timer.setInterval(_TRAY_ICON_POLL_MS)
+        timer.timeout.connect(self._poll_tray_icon)
+        self._tray_icon_timer = timer
+        timer.start()
+
+    def _poll_tray_icon(self) -> None:
+        """轮询槽：拿到帧即换头像并停表；超预算只降频（5s）继续等，绝不放弃。
+
+        legacy 用无时限的 ``frame_ready``（app.py:3185-3192 + window.py:347）
+        换图；sprite 侧没有该信号，若照旧在 20 拍（10s）后永久停表，首帧晚于
+        10s（首跑帧序列转码、慢启动、内存压力）就会让托盘**整个进程生命期**
+        停在占位图标——正是用户报的「托盘栏里没有桌宠图标」。降频而非保频是
+        为了不常驻 500ms 高频表。
+        """
+        self._tray_icon_retries += 1
+        if self._refresh_tray_icon_once():
+            self._stop_tray_icon_poll()
+            return
+        if (self._tray_icon_retries >= _TRAY_ICON_POLL_BUDGET
+                and self._tray_icon_timer.interval() != _TRAY_ICON_SLOW_POLL_MS):
+            self._tray_icon_timer.setInterval(_TRAY_ICON_SLOW_POLL_MS)
+
+    def _stop_tray_icon_poll(self) -> None:
+        timer = getattr(self, "_tray_icon_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def _refresh_tray_icon_once(self) -> bool:
+        """能拿到角色帧就把托盘图标换成它；返回是否已换（拿到帧）。"""
+        pm = self.icon_pixmap(64)
+        if pm is None or self.tray is None:
+            return False
+        self.tray.setIcon(QIcon(pm))
+        return True
+
+    # ---------------------------------------------------------------- 图标面
+    def _idle_first_frame_pixmap(self):
+        """idle 首帧位图（``_tray_icon`` 原有取图链）；取不到返回 ``None``。
+
+        ``lib.movie()`` 惰性建 clip：未起播的 clip ``currentPixmap()`` 为空 →
+        ``None``，由调用方决定兜底（托盘回退爪印占位图标 / 岛稍后重试）。
+        """
+        try:
+            cats = catalog.build_categories(
+                self.lib.names(), self.lib.manifest,
+                self.lib.folder_map, self.lib.folder_files)
+            idle = cats["idles"][0] if cats["idles"] else None
+            pm = self.lib.movie(idle).currentPixmap() if idle else None
+        except Exception:
+            return None
+        if pm is None or pm.isNull():
+            return None
+        return QPixmap(pm)
+
+    def icon_pixmap(self, size: int = 64):
+        """主 sprite 当前帧图标（裁透明留白 + 缩放）；帧未就绪返回 ``None``。
+
+        窗口版 ``PetWindow.icon_pixmap`` 的 sprite 等价物，两个消费方共用：
+
+        - 灵动岛头像 provider（app.py ``_island_icon_pixmap``）：``None`` = 帧未
+          就绪，岛侧按 ``dynamic_island._icon_pixmap`` 的契约稍后重试（不缓存 None）；
+        - 托盘图标 ``_tray_icon``：拿不到才回退爪印占位图标。
+
+        取图顺序：sprite 当前帧 → idle 首帧（``_tray_icon`` 旧逻辑原样保留）。
+        """
+        pm = _sprite_current_pixmap(self.sprite)
+        if pm is None:
+            pm = self._idle_first_frame_pixmap()
+        if pm is None:
+            return None
+        return _crop_icon_pixmap(pm, size)
+
+    # ---------------------------------------------------------------- 4.1b 窗口能力
+    def refresh_settings(self) -> None:
+        """外部配置变更应用点（AppShell._apply_external_config_change 扇出）。"""
+        self._apply_window_capabilities()
+        # self_talk 族热改：重读字段并按新口径重排程（schedule_self_talk
+        # 先停表再按 enabled 早退，开/关/改间隔都收敛到这一条路径）。
+        self._load_self_talk_settings()
+        self._schedule_self_talk()
+        # The visible presenter may be any slot; style and text size belong to
+        # each pet, never to the process-wide configuration.
+        for sprite in self._all_sprites():
+            self._refresh_sprite_bubble_style(sprite)
+        self.sync_music_lyric()
+        # M5f：音乐自动唱歌开关热改（开→启轮询，关→停表并退出唱歌态）
+        self.sync_music_sing()
+
+    def _apply_window_capabilities(self) -> None:
+        """按当前配置应用窗口能力（4.1b parity）：on_top / 穿透复合 /
+        全屏与光标监视器门 + 逐 sprite 设置。
+
+        窗口级设置逐宿主下发（``_apply_host_window_caps``）：**每一块屏的窗口**都要
+        带上同一组配置，否则副屏那张 overlay 会保持默认置顶/不穿透/不锁位（用户改
+        设置只在主屏生效）。
+        """
+        self._user_mouse_through = bool(self._config.get("mouse_through", False))
+        self._apply_effective_mouse_through()
+        self.set_on_top(bool(self._config.get("on_top", True)), persist=False)
+        for host in self._hosts:
+            self._apply_host_window_caps(host)
+        self._sync_sprite_settings()
+        self._watcher.set_fullscreen_enabled(
+            bool(self._config.get("auto_hide_fullscreen", True)))
+        self._watcher.set_cursor_enabled(
+            bool(self._config.get("cursor_hidden_passthrough", True)))
+        # 预测预热提前量（config predict_prewarm_lead_ms，范围 200-600，0=关）
+        try:
+            lead_ms = int(self._config.get("predict_prewarm_lead_ms", 350) or 350)
+        except (TypeError, ValueError):
+            lead_ms = 350
+        lead_ms = max(0, min(600, lead_ms))
+        for host in self._hosts:
+            host.behavior._predict_lead_s = lead_ms / 1000.0
+            host.behavior.predict_enabled = lead_ms > 0
+
+    def _apply_host_window_caps(self, host) -> None:
+        """一张宿主窗口的窗口级配置：置顶/穿透/锁位/不透明度。
+
+        整组刷新（``_apply_window_capabilities``）与**运行期新建的屏**（第一次被占用）
+        都走这一处——漏下发哪一项，那张窗就停在"出厂默认"（副屏的宠盖住桌面、
+        锁定位在该窗不起作用）。置顶经 ``set_on_top`` 下发（它是"逐宿主写同一值"的
+        入口，同值早退，循环调用是幂等的）。
+        """
+        overlay = host.overlay
+        self.set_on_top(bool(self._config.get("on_top", True)), persist=False)
+        overlay.mouse_through = bool(
+            self._user_mouse_through or self._auto_cursor_hidden)
+        # M5a/M5b：拖拽闸门（锁定位 / SHIFT 门）推到 overlay——命中按下不进
+        # 拖拽 grab，点击语义保留（legacy window.py:3126-3133 / :3172-3181）
+        overlay.lock_position = bool(self._config.get("lock_position", False))
+        overlay.shift_drag_required = bool(self._config.get("shift_drag", False))
+        # M5c：整窗不透明度（overlay 单窗 = legacy 单宠窗口语义）
+        overlay.apply_opacity(self._pet_opacity_percent())
+
+    def _pet_opacity_percent(self) -> int:
+        """``pet_opacity`` 配置读数（10-100 钳制，口径同 window.py:3853-3857）。"""
+        try:
+            value = int(float(self._config.get("pet_opacity", 100)))
+        except (TypeError, ValueError):
+            value = 100
+        return max(10, min(100, value))
+
+    def set_on_top(self, on: bool, *, persist: bool = True) -> None:
+        """窗口置顶（window.py set_on_top 等价）：逐宿主窗口一起改。
+
+        同一组配置对每一块屏的窗口都生效；同值早退避免 ``setWindowFlag`` 重建
+        原生窗口带来的可见闪烁。
+        """
+        on = bool(on)
+        changed = False
+        for host in self._hosts:
+            overlay = host.overlay
+            current = bool(overlay.windowFlags()
+                           & Qt.WindowType.WindowStaysOnTopHint)
+            if on == current:
+                continue
+            changed = True
+            was_visible = overlay.isVisible()
+            overlay.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+            if was_visible:
+                overlay.show()  # setWindowFlag 重建原生窗口会先隐藏
+            # 原生窗口重建后旧 HWND 的锁屏通知注册随之失效，按新句柄补注册
+            self._register_session_notifications(host)
+        if not changed:
+            # 同值早退（防御性）：setWindowFlag 会重建原生窗口并先隐藏，
+            # 重复调用（refresh_settings 每次都走这里）会造成可见闪烁。
+            return
+        if persist:
+            self._config.set("on_top", on)
+            save = getattr(self._config, "save", None)
+            if callable(save):
+                save()
+
+    def _sync_sprite_settings(self) -> None:
+        """config → sprite/behavior 同步点（legacy ``window.py``
+        ``refresh_pet_settings`` 的等价物）：启动、``refresh_settings`` 与
+        spawn 后各走一次。
+
+        缺了它（DS 全量审查 M6）：``drag_physics``/``throw_strength``/
+        ``no_move``/``playback_speed`` 只在右键菜单里能改——启动不读 config
+        （上次保存的重启即丢）、设置页改了没反应；且 sprite 侧默认值
+        （``drag_physics=True``、``throw_speed_cap=MAX_THROW_SPEED=6000``）与
+        config 默认（``False``、standard=4800）**相反**，开箱行为就不一致。
+
+        B7b：逐 sprite **各取自己那份配置**（主 = 主配置，子 = 各自的
+        ``config-slot-N.json``，缺键取同源默认）——旧架构每窗读自己的 cfg，
+        本方法此前一律推主设置（审计 C1 的核心缺口）。
+        """
+        cfg = self._config
+        # 碰撞物理 4 键（设置页「碰撞参数（高级）」）：旧架构每只宠各读自己
+        # 的 cfg 组策略并在逐次求解时使用（collision_client.py:140-145 /
+        # :558-563）；世界侧 solve_multi_body_collision 每次 tick 现读这组
+        # 属性（sprite_collision.py:291-293 / :429 / :455），故运行期赋值即生效。
+        # 世界只有一份（一次只有一个合成窗），故这 4 键按主配置**全局**生效。
+        self._sync_collision_physics(cfg)
+        self._invalidate_sprite_configs()  # 配置同步边界：per-slot 快照重读
+        for sprite in list(self._all_sprites()):
+            slot = self._spawned_slots.get(sprite)
+            if slot is None:
+                self._apply_sprite_settings_to(sprite)
+            else:
+                self._apply_child_profile(slot)
+        self._sync_sprite_collision_flags()  # G4：逐 sprite 资格位（见该方法）
+        # 窗口级行为设置（不移动 / 动画间隔）逐宿主下发：每块屏的宠共用同一条
+        # 掷骰链策略
+        for host in self._hosts:
+            host.behavior.no_move = bool(cfg.get("no_move", False))
+            # M5d：动画间隔（动作/移动播完后的强制氛围步）同步到控制器；
+            # 改 0 由 setter 立即取消在跑的 gap
+            try:
+                gap = max(0.0, min(
+                    3600.0, float(cfg.get("animation_gap_seconds", 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                gap = 0.0
+            host.behavior.animation_gap_seconds = gap
+        # 刚刚按 slot 配置重算过资格位 → 同步刷新 stat 签名缓存，下一次目录事件
+        # 才能准确判断"slot 配置到底有没有变"（只 stat，不读内容）。
+        self._slot_signature_cache = self._slot_config_signatures()
+
+    def _apply_sprite_settings_to(self, sprite, cfg=None) -> None:
+        """把**一只 sprite 自己那份**设置下发到它的运行态。
+
+        ``_sync_sprite_settings`` 的全量循环与"某个 slot 文件变了"的窄路径共用
+        这一处：per-slot 键（见 :data:`PER_SLOT_SETTING_KEYS`）逐 sprite 取源，
+        缺键取同源默认。窗口级键（no_move / animation_gap / on_top / 透明…）不在
+        此列——它们只有一份窗，仍由壳全局下发。
+        """
+        if sprite is None:
+            return
+        cfg = self._sprite_config(sprite) if cfg is None else cfg
+        sprite.throw_speed_cap = throw_speed_cap(cfg.get("throw_strength"))
+        sprite.drag_physics = bool(cfg.get("drag_physics", False))
+        # 静止放手下落（#219）：与 drag_physics 平级，逐 sprite 取自己那份配置
+        sprite.drop_gravity = bool(cfg.get("drop_gravity", False))
+        # 桌宠大小（scale）：旧机 refresh_pet_settings 即时 change_scale
+        # （window.py:3937-3938），改完即改气泡画布/锚点。
+        scale = self._config_scale(cfg)
+        if abs(float(getattr(sprite, "scale", scale)) - scale) > 1e-9:
+            try:
+                sprite.scale = scale
+            except (TypeError, ValueError):
+                logging.debug("overlay: scale 应用失败", exc_info=True)
+            else:
+                self.on_sprite_scale_changed(sprite)
+        # ffmpeg 圈边界回收阈值（config 缺省 10；0=关闭）：与 playback_speed 同点
+        # 同步。归一/夹取在 webm_clip.set_recycle_minutes，这里只透传配置值。
+        recycle_minutes = cfg.get("ffmpeg_recycle_minutes", 10)
+        sprite.ffmpeg_recycle_minutes = recycle_minutes
+        clip = getattr(sprite, "_clip", None)
+        push = getattr(clip, "set_recycle_minutes", None)
+        if callable(push):
+            push(recycle_minutes)
+        try:
+            playback = max(0.25, min(3.0, float(cfg.get("playback_speed", 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            playback = 1.0
+        # 已绑定的 clip 热改即生效：只推参数，不重绑/不重启播放（旧 refresh
+        # 的 `:3984-3985` 同款），缺该方法的 clip 跳过。
+        if float(getattr(sprite, "playback_speed", 1.0)) != playback:
+            sprite.playback_speed = playback
+            setter = getattr(clip, "set_playback_speed", None)
+            if callable(setter):
+                setter(playback)
+
+    def _config_scale(self, cfg=None) -> float:
+        """config ``scale``（桌宠大小）→ sprite 缩放；缺键/坏值走默认。
+
+        夹取范围同配置落库口径（config.py 对 ``spawn_scale`` 的 0.1~4.0），
+        避免手工写坏的配置文件把 sprite 尺寸设成 0 或天文数字（sprite.scale
+        setter 只拒非正数）。
+        """
+        cfg = self._config if cfg is None else cfg
+        try:
+            value = float(cfg.get("scale") or catalog.DEFAULT_SCALE)
+        except (TypeError, ValueError):
+            value = catalog.DEFAULT_SCALE
+        return max(0.1, min(4.0, value))
+
+    def _sync_collision_physics(self, cfg=None) -> None:
+        """config 的碰撞物理 4 键 → ``SpriteCollisionWorld`` 求解参数。
+
+        旧架构每个桌宠进程逐窗读自己 cfg 的组策略并在逐次求解时使用
+        （``collision_client.py:140-145`` policy 四键 / ``:558-563`` 传入
+        ``solve_collision_impulse``）。overlay 世界在 __init__ 只用形参默认值
+        建了一次，此后无任何写入点——设置页四个滑块（含重启）完全无效。
+
+        世界侧每次 tick 现读这组属性（``sprite_collision.py:291-293`` 传
+        restitution/friction/impulse_cap、``:429``/``:455`` 传 mass_scale），
+        故这里赋值即运行期生效。夹取范围同 config 归一（config.py:668-671）。
+        世界逐屏一份，故逐宿主下发同一组值（全局设置对所有屏一致）。
+        """
+        cfg = self._config if cfg is None else cfg
+        # 缺键/坏值 → 保留世界当前值（构造时的形参默认 = config 缺省）。
+        for host in self._hosts:
+            world = host.collision
+            world.restitution = self._clamped_config_float(
+                cfg, "collision_restitution", world.restitution, 0.0, 1.0)
+            world.friction = self._clamped_config_float(
+                cfg, "collision_friction", world.friction, 0.0, 0.30)
+            world.mass_scale = self._clamped_config_float(
+                cfg, "collision_mass_scale", world.mass_scale, 0.5, 2.0)
+            world.impulse_cap = self._clamped_config_float(
+                cfg, "collision_impulse_cap", world.impulse_cap, 1000.0, 12000.0)
+
+    @staticmethod
+    def _clamped_config_float(cfg, key: str, default: float,
+                              low: float, high: float) -> float:
+        """读一个带上下限的浮点键；缺键/坏值回退 ``default``（再夹取）。"""
+        raw = cfg.get(key, None)
+        if raw is None:
+            raw = default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = float(default)
+        return max(low, min(high, value))
+
+    def _sync_sprite_collision_flags(self) -> None:
+        """只重算逐 sprite 的**宠物间碰撞资格位**（不动其它任何设置）。
+
+        G4：资格位 = per-sprite 口径（主 sprite 用本进程 config，子 sprite 用它
+        自己的 config-slot-N.json，见 ``_sprite_collision_enabled``）。世界按
+        pair 过滤见 ``sprite_collision._ignored_pet_pairs``；岛-宠接触不受它影响，
+        岛墙由 ``dynamic_island.collision_enabled`` 单独控制。
+
+        独立成窄入口的原因：子宠 slot 配置变化（目录事件 / 既有 3s 兜底轮询）只
+        该重算资格位，**不得**顺手重刷 playback/drag_physics/no_move 等主配置项
+        ——那些归 ``_sync_sprite_settings``（refresh_settings 的全量语义）。
+        """
+        for sprite in list(self._all_sprites()):
+            sprite.collision_enabled = self._sprite_collision_enabled(sprite)
+
+    def _sprite_collision_enabled(self, sprite) -> bool:
+        """该 sprite 的宠物间总碰撞资格（per-sprite 口径 = 各自的 config）。
+
+        旧契约（base-2786c15）：每个桌宠是独立进程、各读自己的 config
+        （``window.py:3929``），子宠的 ``config-slot-N.json`` 由设置进程按其身份
+        写就。本方法把这条身份→配置的对应关系在当前单进程壳里复原：
+
+        - 主 sprite（``self.sprite``）= 本进程运行期 config（主配置）；
+        - 子 sprite = 它自己的清洗档案快照，缺文件/缺键按同源默认 true；
+        - 陌生 sprite（不在身份表）退回主配置值，绝不瞎猜 slot。
+
+        只在配置刷新 / spawn·复活 / 提升等边界调用，不参与逐帧 tick。
+        """
+        if sprite is None or sprite not in self._spawned_slots:
+            return True
+        return bool(self._sprite_config(sprite).get("collision_enabled", True))
+
+    def _apply_effective_mouse_through(self) -> None:
+        """有效穿透 = 用户手动穿透 OR 光标自动穿透（window.py:4204 同式）。
+
+        逐宿主下发：穿透/避让都是"整组桌宠"的状态，只给主屏窗口设会让副屏那张
+        overlay 一直吞点击（用户看到的是"副屏的宠盖住了我的桌面"）。
+        """
+        through = bool(self._user_mouse_through or self._auto_cursor_hidden)
+        for host in self._hosts:
+            host.overlay.mouse_through = through
+
+    def _on_user_through_changed(self, on: bool) -> None:
+        """菜单「鼠标穿透」直写收编：记用户意愿 + 持久化 + 复合重算。"""
+        self._user_mouse_through = bool(on)
+        self._config.set("mouse_through", self._user_mouse_through)
+        save = getattr(self._config, "save", None)
+        if callable(save):
+            save()
+        self._apply_effective_mouse_through()
+
+    def _on_fullscreen_changed(self, hit: bool) -> None:
+        """全屏出现 → 隐藏；退出 → 恢复（window_screen.on_fullscreen_changed 等价）。
+
+        自动隐藏与手动隐藏同语义（4.3 后半）：隐藏期间 proactive/agent_link
+        一并 pause，恢复时 resume——legacy 的 ``host.hide()`` 走自定义 hide →
+        ``_pause_activity`` 正是这条链。
+        """
+        # 诊断留痕：探测翻转时记录判定原因（2026-09-23 实机抓到 1Hz 翻转，
+        # 无原因无法归因——probe 的 why 串本来就有，只差落日志）
+        why = ""
+        try:
+            from . import platform_win
+            why = platform_win._fg_fullscreen_probe()[1]
+        except Exception:
+            pass
+        logging.info("overlay: 全屏状态变化 hit=%s auto_hidden=%s why=%s",
+                     hit, self._auto_hidden, why)
+        # 免打扰（issue #208）：全屏 = 等效免打扰的唯一来源（与 legacy 的
+        # AppShell._on_shared_fullscreen 同一处判定，不另起探测）。
+        # 入场先立闸（隐藏动作自身带出的呈现不漏门控）；退场等 overlay 真正
+        # 显示回来之后再结算——结束汇报只投向可见目标，早一拍就是汇报给空气。
+        from . import quiet_mode
+
+        if hit:
+            quiet_mode.note_fullscreen(True)
+            if not self._auto_hidden and self._any_host_visible():
+                self._auto_hidden = True
+                self._hide_bubble_for_visibility()
+                self._set_all_clips_paused(True)
+                self._hide_all_hosts()
+                self._pause_shared_subsystems()
+                self._pause_warm_all()
+                self._note_sprite_visibility_changed()
+            return
+        if self._auto_hidden:
+            self._auto_hidden = False
+            self._show_all_hosts()
+            self._restore_sticky_bubble()
+            self._resume_shared_subsystems()
+            self._set_all_clips_paused(False)
+            self._resume_warm_all()
+            self._note_sprite_visibility_changed()
+        # 退场结算：**无条件**落在最后（手动隐藏时上面那一支不走，但免打扰的
+        # 等效状态必须落下，否则全屏标志永远停在 True）。此刻 overlay 若已恢复
+        # 显示，结束汇报才交付出得去。
+        quiet_mode.note_fullscreen(False)
+
+    def _cursor_transition_blocked(self) -> bool:
+        """有 grab 在途（含 click-only：锁定位 / 未按 SHIFT 的按住也持有
+        ``_mouse_grab``）——此刻不许改穿透态（window._cursor_transition_blocked
+        只看拖拽态，本壳的判据是任意 grab）。任一屏的窗口持有 grab 都算。"""
+        return any(getattr(host.overlay, "_mouse_grab", None) is not None
+                   for host in self._hosts)
+
+    def _converge_auto_cursor_hidden(self) -> None:
+        """自动穿透态收敛（幂等）：无 grab 在途即解除光标隐藏态。
+
+        触发面（壳层在 ``OverlayShell.__init__`` 挂到 overlay 上，两处都直接
+        挂本函数）：``_shown_cb``（每次 overlay 显示/恢复）与
+        ``_user_input_cb``（``OverlayWindow._note_user_input``：真到达窗口的
+        鼠标输入）。
+
+        语义 = 「无 grab 阻挡即清，真实 HIDDEN 由 watcher 下一拍重建」。收敛
+        时机本身就是证据，不查"最后一次探测说了什么"（曾有过一道 HIDDEN 闸，
+        2026-10-15 撤销——见下）。
+
+        为什么不能只靠 SHOWING：解除这件事原本挂在"收到 SHOWING 且无 grab"
+        上，而滞留状态只有 ``_on_grab_finished`` 会冲刷——grab 一旦卡死
+        （丢 release）就再没有收尾事件，窗口会永久停在"看得见点不到"。
+
+        两道闸（按序）：
+
+        1. ``_auto_cursor_hidden`` 为假 = 没有待解除的自动穿透（幂等）；
+        2. grab 在途（``_cursor_transition_blocked()``）= 此刻不许动穿透态，
+           但**不能丢弃这次收敛请求**：记 ``_converge_pending``，由
+           ``_on_grab_finished`` 在 grab 收尾后补做。丢掉它就会出现"隐藏后
+           重新显示、探针报 UNKNOWN 不产生回调"这条链上的永久卡死（show 的
+           收敛被 grab 挡掉、看门狗随后清掉 grab，而 grab 收尾只处理
+           ``_cursor_restore_pending``，再没人认这笔账）。
+
+        为什么撤掉 HIDDEN 闸（它曾用来挡屏迁移后 ≤50ms 的误拦截）：屏迁移先
+        显示新 overlay 再关旧的，可见性计数 1→2→1 不翻转 → 闸门不补探测，
+        没有闸就会在这一刻清掉真实穿透、下一拍 50ms 轮询前错误拦截点击。但
+        那道闸制造的新风险是永久卡死——生产上 ``_auto_cursor_hidden`` 必由
+        HIDDEN 回调置位（最后见过的必是 HIDDEN），探针转 UNKNOWN 后再无回调、
+        待办补做被闸门永远拦住，窗口永久"看得见点不到"。两害相权：误拦截是
+        ≤1 拍的自愈窗口（探针恢复报 HIDDEN 即重建穿透），卡死不会自愈。故
+        去掉闸门，把这一拍的误拦截当成**刻意接受的代价**。
+
+        定位：显示/恢复与输入两道**都不是通用自愈**。正常穿透开着时点击到不了
+        窗口，输入这条只在窗口重建 / 屏迁移把原生样式与标记弄脱同步时接得上；
+        真正解开"grab 卡死"的是看门狗（``OverlayWindow._check_stale_press``）。
+        """
+        if not self._auto_cursor_hidden:
+            return
+        if self._cursor_transition_blocked():
+            self._converge_pending = True
+            return
+        self._cursor_restore_pending = False
+        self._converge_pending = False
+        self._auto_cursor_hidden = False
+        self._apply_effective_mouse_through()
+
+    def _on_cursor_visibility_changed(self, visibility: str) -> None:
+        """光标隐藏（watcher 已做 0.2s 去抖）→ 自动穿透；恢复 → 解除。
+
+        watcher 每拍（20Hz）都会重报当前状态，故这里也是"真实 HIDDEN 重建
+        穿透"的来源（收敛清掉后 ≤1 拍内被置回）。
+        """
+        if visibility == "HIDDEN":
+            if not self._cursor_transition_blocked():
+                self._auto_cursor_hidden = True
+                self._apply_effective_mouse_through()
+        elif visibility == "SHOWING":
+            if self._cursor_transition_blocked():
+                self._cursor_restore_pending = True
+            else:
+                self._cursor_restore_pending = False
+                self._auto_cursor_hidden = False
+                self._apply_effective_mouse_through()
+
+    def _on_grab_finished(self) -> None:
+        """拖拽收尾（overlay._finish_grab 钩子）：冲刷光标恢复滞留 + 拆空宿主。
+
+        尾段补做被 grab 闸住的收敛请求（``_converge_pending``）：此刻 grab 已
+        清，补做直接生效（收敛函数只看这两道闸）。
+        跨屏拖拽把一块屏上的最后一只宠带走时，那块屏的窗口在**这次 grab 结束
+        之后**才拆（拖拽期间拆掉正在接受输入的窗口，会话就再也收不了尾）。
+        """
+        if self._cursor_restore_pending:
+            self._cursor_restore_pending = False
+            self._auto_cursor_hidden = False
+            self._apply_effective_mouse_through()
+        if self._converge_pending:
+            self._converge_pending = False
+            self._converge_auto_cursor_hidden()
+        self._reap_empty_hosts()
+
+    # ---------------------------------------------------------------- 4.2a 位置持久化
+    def _pos_from_ratios(self, rx: float, ry: float, sprite=None,
+                         bounds=None) -> QPointF:
+        """rx/ry（身体中心相对可用区比例）反解 sprite 左上角坐标。
+
+        口径同 window_placement.restore_position：以**身体框**中心为锚，扣除
+        身体框在 sprite 矩形内的偏移（body_box 未声明的角色退化为全画布）。
+        可用区取该宠所在宿主的（``bounds`` 显式给出时优先）——多屏下比例是
+        **相对它那块屏**记的，用主屏边界反解会把副屏那只放到错误位置。
+        """
+        sprite = self.sprite if sprite is None else sprite
+        if bounds is None:
+            bounds = self.host_for_sprite(sprite).bounds
+        body = (sprite.body_rect() if hasattr(sprite, "body_rect")
+                else sprite.rect())
+        bw, bh = body.width(), body.height()
+        cx = bounds.left() + rx * bounds.width()
+        cy = bounds.top() + ry * bounds.height()
+        off_x = body.x() - sprite.rect().x()
+        off_y = body.y() - sprite.rect().y()
+        return QPointF(cx - bw / 2 - off_x, cy - bh / 2 - off_y)
+
+    def _sprite_geometry(self, sprite, bounds: QRect) -> dict | None:
+        """sprite 当前几何 → rx/ry/facing/scale（save_position 的共用算式）。
+
+        bounds 非法（未初始化/退化为 0 宽高）返回 None：宁可不落盘，也不写
+        NaN/Inf 比例污染下一次恢复。
+        """
+        if bounds.width() <= 0 or bounds.height() <= 0:
+            return None
+        body = (sprite.body_rect() if hasattr(sprite, "body_rect")
+                else sprite.rect())
+        cx = body.x() + body.width() / 2.0
+        cy = body.y() + body.height() / 2.0
+        geometry = {
+            "rx": (cx - bounds.left()) / bounds.width(),
+            "ry": (cy - bounds.top()) / bounds.height(),
+            "scale": float(getattr(sprite, "scale", 1.0) or 1.0),
+        }
+        facing = getattr(sprite, "facing", None)
+        if facing in ("left", "right"):
+            geometry["facing"] = facing
+        return geometry
+
+    def _restore_position(self) -> None:
+        """按"身体中心相对可用区比例"恢复位置（window_placement.restore_position
+        语义；贴边钳制由 set_pos 的 body_box 钳制收口）。
+
+        实际复活走 ``_spawn_slot`` 的 slot 档案路径（含 ``screen_name``），本方法
+        只在没有档案状态的调用点兜底。
+        """
+        host = self.host_for_sprite(self.sprite)
+        rx, ry = self._config.get("rx"), self._config.get("ry")
+        if rx is None or ry is None:
+            self.sprite.set_pos(self._default_corner_pos(
+                host.bounds, self.sprite.rect()))
+        else:
+            self.sprite.set_pos(self._pos_from_ratios(
+                float(rx), float(ry), bounds=host.bounds))
+        facing = str(self._config.get("facing", "") or "")
+        if facing in ("left", "right"):
+            self.sprite.facing = facing
+
+    def save_position(self) -> None:
+        """身体中心相对可用区比例持久化（window_placement.save_position 语义）。"""
+        if self.sprite is not None:
+            self._save_child_geometry(self.sprite, slot=0)
+
+    # ---------------------------------------------------------------- 4.2b 多 sprite 生灭
+    def _spawn_config_dir(self):
+        """子肥鱼身份/几何的落盘目录（= 主配置目录）；假配置对象无 dir → None。"""
+        return getattr(self._config, "dir", None)
+
+    def _active_slots(self) -> list[int]:
+        """进程内活跃身份（spawn 顺序）= 当前活跃宠清单的内容。"""
+        return sorted(self._remembered_active)
+
+    def _all_sprites(self):
+        return ([self.sprite] if self.sprite is not None else []) + list(self._spawned)
+
+    def _sprite_for_slot(self, slot):
+        if slot == 0:
+            return self.sprite
+        return next((s for s in self._spawned if self._spawned_slots.get(s) == slot), None)
+
+    def _persist_active_slots(self) -> bool:
+        """活跃宠清单落盘（spawn/退出/复活各调一次，原子替换）。返回是否真的写成。
+
+        这条路径上的调用者**全是用户显式动作**（生成 / 恢复 / 关闭），所以坏文件走
+        ``on_broken="backup-overwrite"``：先备份再覆盖。默认 ``refuse`` 只适用于
+        "没有用户在场"的写入；在这里继续 refuse 的后果是「生成的宠重启就没了」
+        「关掉的宠重启还在」永远修不好，而 UI 里没有任何解释（2026-10-10 ops D1）。
+
+        失败**必须可见**：调用方的"成功"叙事（菜单关了、宠上屏了）不能盖过这一层——
+        日志 + 气泡点名路径，绝不静默。启动期的自动复活**不写盘**（不替用户改盘、
+        不自动修复坏文件）。
+        """
+        config_dir = self._spawn_config_dir()
+        if not config_dir:
+            return False
+        from . import pet_profiles
+
+        result = pet_profiles.save_active_set(
+            config_dir, self._active_slots(), on_broken="backup-overwrite")
+        if result.status != "ok":
+            logging.error("overlay: 活跃宠清单落盘失败（%s）：%s → %s",
+                          result.status, result.reason, result.path)
+            self.show_bubble(
+                f"桌宠状态没能记住：活跃状态文件写入失败，重启后这次改动会丢失。\n"
+                f"文件：{result.path}", duration_ms=9000)
+            return False
+        if result.backup_path is not None:
+            logging.warning("overlay: 原活跃宠清单不可信，已备份到 %s 后重建",
+                            result.backup_path)
+        return True
+
+    def _spawn_failure_text(self, slot: int, exc: Exception) -> str:
+        """生成失败的说明文案：点名槽位与**该槽档案路径**，slot0 损坏时用降级诊断。
+
+        slot0 降级诊断（``slot0_profile_diagnosis``）本来就是"含路径 + 修好即可恢复"
+        的整句，此时优先用它——比复述异常字符串有用得多。
+        """
+        from . import pet_profiles
+
+        if slot == 0 and self.slot0_profile_diagnosis():
+            return f"生成桌宠失败：{self.slot0_profile_diagnosis()}"
+        text = f"生成桌宠失败（slot-{slot}）：{exc}"
+        config_dir = self._spawn_config_dir()
+        if config_dir:
+            try:
+                text += f"\n档案：{pet_profiles.slot_profile_path(config_dir, slot)}"
+            except Exception:
+                logging.debug("overlay: 取该槽档案路径失败", exc_info=True)
+        return text
+
+    def _notify_spawn_failed(self, slot: int, exc: Exception) -> None:
+        """生成失败的**可见**反馈（2026-10-10 终审 ops D2-新）。
+
+        旧实现只有 ``logging.exception``：坏 slot0 期间点「生成 / 恢复」没有任何反应，
+        而分配器每次都按最小目标回到 0（用户明确取舍：不静默跳号），于是每次点都失败
+        且无声——正是 B01 要消灭的「点了没反应」。
+
+        通道按"谁能真上屏"降级：有宠在屏 → 冒一条带路径的气泡；**一只宠都没有**
+        （消息无落点，刚关掉最后一只/全隐藏）→ 把同一份说明落进可见恢复窗，那是此时
+        唯一的可见入口。有宠但整窗被隐藏等情况下气泡上不了屏时，只如实记一条警告，
+        不硬造第二个入口。
+        """
+        text = self._spawn_failure_text(slot, exc)
+        if self.show_bubble(text, duration_ms=12000):
+            return
+        if self._all_sprites():
+            logging.warning("overlay: 生成失败提示未能上屏（无可见气泡面）：%s",
+                            text.replace("\n", " | "))
+            return
+        self._show_recovery_diagnosis(text)
+
+    def _show_recovery_diagnosis(self, text: str) -> None:
+        """把一条上不了屏的说明落进**可见恢复窗**（无宠时唯一的可见入口）。"""
+        self._ensure_recovery_entry(force=True)
+        label = getattr(self, "_recovery_diagnosis_label", None)
+        if label is None:
+            return
+        try:
+            label.setText(str(text))
+            label.setVisible(True)
+        except RuntimeError:                      # 窗口已随进程销毁
+            logging.debug("overlay: 恢复窗诊断标签已失效", exc_info=True)
+
+    def spawn_pet(self) -> None:
+        """生小肥鱼（app.py spawn_pet 进程内路径语义 + D6 无锁身份分配）。
+
+        分配 slot 身份 → 建 per-pet 库 + 新 sprite（自主宠向右逐级错开，重叠
+        规避由 body 钳制兜底）→ 进活跃清单并落盘。无可用身份时冒泡告知（B01，
+        分配器兜底后几乎不可达），**建库/读档案失败也一律可见告知**（带该槽档案
+        路径，见 :meth:`_notify_spawn_failed`）；两条失败都不留半只 sprite。
+
+        目标槽仍是**最小非活跃槽**（含 0）：slot0 档案损坏期间每次点都落到 0 并失败，
+        这是用户明确的取舍（最小补位，不静默跳号）；能做的不是绕开它，而是把失败说清楚
+        （2026-10-10 ops D2-新）。
+        """
+        config_dir = self._spawn_config_dir()
+        try:
+            slot = overlay_spawn_state.allocate_slot(
+                config_dir, active_slots=self._active_slots())
+        except Exception:
+            logging.exception("overlay: 生小肥鱼失败（无可用 slot 身份）")
+            # B01：分配兜底后这条路径只剩「128 个身份全活跃」一种可能，但绝不
+            # 能再只写日志——静默失败在用户眼里就是「点了没反应」。
+            self.show_bubble(
+                f"生小肥鱼失败：位置身份已耗尽（1-{overlay_spawn_state.MAX_SCAN_SLOTS}"
+                " 全部占用）", duration_ms=6000)
+            return
+        try:
+            self._spawn_slot(slot)
+        except Exception as exc:
+            logging.exception("overlay: 生小肥鱼失败 (slot=%s)", slot)
+            self._notify_spawn_failed(slot, exc)
+            return
+        self._remembered_active.append(slot)
+        self._slot_signature_cache = self._slot_config_signatures()
+        if slot == 0:
+            self._rebind_main_sprite()
+            self._load_self_talk_settings()
+            self._schedule_self_talk()
+        self._persist_active_slots()
+        self._refresh_tray_menu()  # 托盘逐只条目随生灭重建（4.2c）
+        logging.info("overlay: 已生成子肥鱼 (slot=%s)", slot)
+        # 无宠期留着的待恢复提醒：有新宠上屏时补回（仍是同一条，不重新入队）
+        self._sync_alert_copy()
+
+    def _spawn_slot(self, slot: int) -> None:
+        before = set(self._all_sprites())
+        try:
+            self._build_slot_sprite(slot)
+        except Exception:
+            for sprite in set(self._all_sprites()) - before:
+                host = self._host_of(sprite)
+                self._close_self_talk_host(sprite)
+                self._close_sprite_bubble(sprite)
+                self._sprite_cfg_cache.pop(sprite, None)
+                self._sprite_hosts.pop(sprite, None)
+                self._spawned_slots.pop(sprite, None)
+                lib = self._spawned_libs.pop(sprite, None) or getattr(sprite, "library", None)
+                if sprite in self._spawned:
+                    self._spawned.remove(sprite)
+                if sprite is self.sprite:
+                    self.sprite = self.lib = None
+                if host is not None:
+                    host.overlay.remove_sprite(sprite)
+                self._shutdown_library(lib, "failed-spawn")
+            self._reap_empty_hosts()
+            raise
+
+    def _build_slot_sprite(self, slot: int) -> None:
+        """按 slot 身份建一只子肥鱼（spawn 与重启复活共用路径，不落清单）。
+
+        身份几何（rx/ry/facing/scale）与**角色**从 ``config-slot-N.json`` 读；
+        有记录 = 重启复活，按比例恢复上次位置、按它自己存的角色建库；无记录 =
+        首次生成，自主宠向右错开（角色继承主配置）。spawn 后按该 slot 的配置
+        下发设置，并建它自己的气泡/自言自语宿主（旧架构一窗一气泡一计时）。
+        """
+        from . import config_write_lock, pet_profiles
+
+        config_dir = self._spawn_config_dir()
+        snapshot = None
+        if config_dir:
+            with config_write_lock.config_write_lock(config_dir):
+                snapshot = pet_profiles.read_slot_snapshot(config_dir, slot)
+                if snapshot.status != "ok":
+                    raise RuntimeError(f"slot-{slot}: {snapshot}")
+                if not snapshot.profile.exists:
+                    from .config import normalize_pet_profile_snapshot
+
+                    source = normalize_pet_profile_snapshot(
+                        pet_profiles.read_slot_profile(config_dir, 0).data)
+                    seed = {key: copy.deepcopy(source[key])
+                            for key in pet_profiles.PER_PET_SETTING_KEYS}
+                    if not self._config.get("spawn_inherit_size", True):
+                        seed["scale"] = self._config.get("spawn_scale", catalog.DEFAULT_SCALE)
+                    result = pet_profiles.write_profile_settings(config_dir, slot, seed)
+                    if not result.ok:
+                        raise RuntimeError(f"slot-{slot}: {result}")
+                result = pet_profiles.begin_slot_generation(config_dir, slot)
+                if not result.ok:
+                    raise RuntimeError(f"slot-{slot}: {result}")
+                snapshot = pet_profiles.read_slot_snapshot(config_dir, slot)
+                if snapshot.status != "ok":
+                    raise RuntimeError(f"slot-{slot}: {snapshot}")
+            slot_data = dict(snapshot.profile.data)
+        else:
+            memory = getattr(self, "_slot_memory", None)
+            if memory is None:
+                self._slot_memory = memory = {}
+            slot_data = memory.setdefault(slot, {
+                key: copy.deepcopy(self._config.get(key, pet_profiles.same_source_default(key)))
+                for key in pet_profiles.PER_PET_SETTING_KEYS})
+        reader = _SpriteConfig(self, None, snapshot=snapshot, data=slot_data)
+        state = overlay_spawn_state._clean_geometry(slot_data)
+        lib = self._create_sprite_library(reader._values, slot)
+        scale = self._config_scale(reader)
+        pet_host = self._host_for_restore(slot, state)
+        try:
+            sprite = self._sprite_factory(lib, QPointF(0, 0), scale)
+            sprite.home_screen = pet_host.screen
+            sprite.set_bounds(QRect(pet_host.bounds))
+            sprite.set_pos(self._spawn_sprite_pos(sprite, state, pet_host))
+        except Exception:
+            self._shutdown_library(lib, "failed-spawn-before-registration")
+            raise
+        facing = state.get("facing")
+        if facing in ("left", "right"):
+            sprite.facing = facing
+        pet_host.overlay.add_sprite(sprite)
+        # O3：新 sprite 的播放节拍按**当前有效可播性**初始化——PetSprite 默认
+        # 未暂停，隐藏/挂起期生成的子宠若不在这里压住，行为链一起播就按帧率
+        # 解码，而窗口根本没有像素要上屏。``visible`` 不动（它逻辑上仍是可见
+        # 宠物），窗口真正显示时由整窗显示路径（含 ``start()``）补放行。
+        if (slot != 0 or hasattr(self, "_watcher")) and not self._clips_playable():
+            self._set_sprite_clip_paused(sprite, True)
+        if slot == 0:
+            self.sprite, self.lib = sprite, lib
+        else:
+            self._spawned.append(sprite)
+            self._spawned_libs[sprite] = lib
+        self._spawned_slots[sprite] = slot
+        reader._sprite = sprite
+        self._sprite_cfg_cache[sprite] = reader
+        self._apply_sprite_settings_to(sprite, reader)
+        sprite.collision_enabled = bool(reader.get("collision_enabled"))
+        sprite._profile_character = str(reader.get("character"))
+        sprite._profile_generation = reader.generation
+        if self._cross_screen_allowed and not state.get("screen_name"):
+            # 首次落位即把屏归属钉死在这块屏上：没被换过屏的宠（尤其新生成的子宠）
+            # 若不留归属，重启时只能跟着**主宠**走——主宠单独拖到副屏后，子宠也会
+            # 跟着过去（旧默认）。只记一笔待写（见 ``_remember_sprite_screen``），
+            # 由这一次落位的几何自存落盘；关闭跨屏时**不记**（那时的落位是临时
+            # 承载，写了就把用户多屏下摆好的归属覆盖掉）。
+            self._remember_sprite_screen(sprite, pet_host.screen)
+        # 这只子肥鱼自己的气泡与自己计时的自言自语（旧架构每窗各一套）
+        self._ensure_sprite_bubble(sprite)
+        host = self._ensure_self_talk_host(sprite)
+        if host is not None:
+            host.schedule()
+        if config_dir:
+            # 生成/复活即落一次几何：未及优雅退出（崩溃/断电）也能按清单复活
+            geometry = self._sprite_geometry(sprite, pet_host.bounds)
+            if geometry and (state.get("rx") is None or state.get("ry") is None):
+                self._save_child_geometry(sprite, slot=slot, geometry=geometry)
+            # 刚写过该 slot 文件 → 签名缓存同步刷新：否则下一次目录事件会把这次
+            # 自写当成"外部变更"，把**别的**子宠的运行态一起重下发（窄契约破了）。
+            self._slot_signature_cache = self._slot_config_signatures()
+
+    def _slot_writer(self, slot: int):
+        """该 slot 的设置写入器（键/值 → ``config-slot-N.json``，原子写）。
+
+        用于"回退默认角色"这类需要把值写回**发起方那份配置**的路径：子肥鱼切角色
+        失败回退时绝不能写到主配置（那是另一只宠的身份）。
+        """
+        config_dir = self._spawn_config_dir()
+
+        def _write(key, value) -> bool:
+            from . import pet_profiles
+
+            if key not in pet_profiles.PER_PET_KEYS:
+                return False
+            if not config_dir:
+                memory = getattr(self, "_slot_memory", None)
+                if memory is None:
+                    self._slot_memory = memory = {}
+                memory.setdefault(slot, {})[key] = copy.deepcopy(value)
+                return True
+            result = pet_profiles.write_profile_settings(
+                config_dir, int(slot), {key: value}, user_customized=True)
+            if not result.ok:
+                logging.warning("overlay: slot-%s 设置未保存：%s (%s)",
+                                slot, result.status, result.reason)
+            return result.ok
+
+        return _write
+
+    def _create_sprite_library(self, slot_data: dict, slot: int):
+        """按**这只子肥鱼自己那份**配置的角色建库（B7b）。
+
+        缺 ``character`` 键或与主宠同角色 → 走既有的 per-pet 库工厂入口
+        ``_create_main_library``（同一件事：按主配置的角色建一只新库，T3 的
+        per-pet 语义不变）；只有该 slot 存了**不同的**角色时才单独建库，且回退
+        默认角色时把值写回它自己的 slot 文件（绝不污染主配置）。
+        """
+        self._library_fallback_used = False
+        main_character = str(self._sprite_config(self.sprite).get(
+            'character', catalog.DEFAULT_CHARACTER))
+        character = str(slot_data.get("character") or main_character)
+        if character == main_character:
+            lib = self._create_main_library()
+            # 主库工厂自带的回退写的是发起方那份配置（slot 0），``slot_data`` 只是
+            # 它的副本：不同步的话 ``_profile_character`` 会记着已被回退掉的旧角色，
+            # 紧接着的 profile 重下发会误判成"要换角色"再白建一次库。
+            if getattr(self, "_library_fallback_used", False):
+                slot_data["character"] = catalog.DEFAULT_CHARACTER
+            return lib
+        writer = self._slot_writer(slot)
+
+        def fallback(key, value):
+            ok = writer(key, value)
+            if ok:
+                slot_data[key] = value
+            return ok
+
+        return self._create_library_for(character, fallback_writer=fallback)
+
+    def _screen_by_name(self, name):
+        """已连接显示器里按名字取（与 ``window_placement.screen_available`` 同口径）。"""
+        if not name:
+            return None
+        for screen in QGuiApplication.screens():
+            try:
+                if screen.name() == name:
+                    return screen
+            except RuntimeError:
+                continue
+        return None
+
+    def _host_for_restore(self, slot, state):
+        """这只宠该落在哪块屏（复活/生成的唯一判据）。
+
+        - **关闭跨屏**（主配置 ``allow_cross_screen`` 为假、本进程快照）→ 都在
+          启动时那块屏：记忆不采纳、不建第二张窗（见下方分支）；
+        - **记忆命中的屏在线**（``screen_name`` 是已连接显示器）→ 那块屏的宿主
+          （还没有就现建一个），比例也在那块屏的可用区里反解；
+        - **记忆不在线 / 没有记忆** → 留在已有归属上，不搬：一段不在线的记忆
+          不该把已经在屏上的宠挪走（legacy ``window_placement.restore_position``
+          同款取舍：屏不在线就落当前屏）。子宠跟随**主宠**那块屏（新宠的旧行为：
+          自主宠向右错开）；槽0 就是主宿主本身，它的窗口 ``self.overlay`` 始终是
+          主宠的窗口（见 ``_main_host``）。
+        """
+        if not self._cross_screen_allowed:
+            # 关闭跨屏：全部宠都在**启动时选定那块屏**（= 主宿主），记忆里的屏
+            # 只作参考不采纳、也不建第二张窗；记忆本身一个字节不动（见
+            # ``_save_child_geometry`` / ``_remember_sprite_screen`` 的分工），
+            # 所以重新开启跨屏并重启，各宠仍回到各自记忆里那块屏。
+            return self._main_host
+        screen = self._screen_by_name(state.get("screen_name"))
+        if slot == 0:
+            if screen is not None and screen is not self._main_host.screen:
+                # 建壳期换屏只搬空窗口；活壳上换屏要搬气泡/重注册/复读可见性
+                if self._built:
+                    self._migrate_to_screen(screen)
+                else:
+                    self._resite_main_host(screen)
+            return self._main_host
+        if screen is not None:
+            return self.host_for_screen(screen) or self._create_host(screen)
+        if self.sprite is not None:
+            return self.host_for_sprite(self.sprite)
+        return self._main_host
+
+    def _resite_main_host(self, screen) -> None:
+        """建壳期把主宿主摆到指定屏（此刻还没有气泡/投喂/会话注册要迁移）。
+
+        与 ``_migrate_to_screen`` 的差别正是"建壳期"：那一位是在**活着的**壳上
+        换屏（要搬气泡文案、重注册锁屏通知、按可见性快照决定是否 show、复读提醒），
+        这里只有一块刚建出来、sprites 为空的窗口。
+        """
+        host = self._main_host
+        if host is None or screen is None or screen is host.screen:
+            return
+        old_overlay = host.overlay
+        self._disconnect_host_screen(host)
+        host.screen = screen
+        host.overlay = ShellOverlayWindow(screen, driver=self.driver)
+        host.overlay.host = host
+        host.overlay.behavior = host.behavior
+        self._wire_host_overlay(host, host.overlay)
+        self._connect_host_screen(host)
+        host.set_bounds(self._local_bounds(screen))
+        old_overlay.close()
+
+    def _spawn_sprite_pos(self, sprite, state: dict, host=None) -> QPointF:
+        """这只宠的落位：有持久化比例按 rx/ry 恢复（比例相对**它那块屏**），
+        否则自主宠向右逐级错开。"""
+        host = self._main_host if host is None else host
+        rx, ry = state.get("rx"), state.get("ry")
+        if rx is not None and ry is not None:
+            return self._pos_from_ratios(
+                float(rx), float(ry), sprite=sprite, bounds=host.bounds)
+        main_here = self.sprite if self._host_of(self.sprite) is host else None
+        if main_here is None:
+            # 这块屏上还没有主宠作参照（该屏第一只）→ 默认右下角（旧语义）
+            return self._default_corner_pos(host.bounds, sprite.rect())
+        index = len(self._spawned) + 1
+        main_body = main_here.body_rect()
+        return QPointF(main_body.x() + main_body.width() + 24 * index,
+                       main_body.y())
+
+    def _restore_spawned_pets(self) -> None:
+        """D5：启动恢复依据 = 活跃宠清单（**不是** slot 配置存在）。
+
+        清单缺失 = 首次运行语义；损坏/缺首字段由 overlay_spawn_state 防御性
+        回退成空清单（只有主宠）。单条复活失败（素材缺失/身份配置被删）只
+        记录并摘除该条，不拖垮启动，也不让坏条目永久留在清单里。
+        """
+        for slot in self._remembered_active:
+            if slot == 0:
+                continue
+            try:
+                self._spawn_slot(slot)
+            except Exception:
+                logging.exception("overlay: 恢复失败，保留活跃身份 slot=%s", slot)
+
+    def _remove_spawned_sprite(self, sprite) -> None:
+        """退出一只子肥鱼：几何先落盘（配置保留）→ remove_sprite（clip 释放
+        V-8 + 行为注销 V-9 挂点）→ 库 shutdown 收尾。
+
+        B7b：随该 sprite 一起收掉它自己的气泡窗、自言自语定时器与缓存视图
+        （旧架构进程退出即整套资源释放；留着就是孤儿顶层气泡 + 空转定时器）。
+        """
+        config_dir = self._spawn_config_dir()
+        slot = self._spawned_slots.pop(sprite, None)
+        self._remembered_active = [n for n in self._remembered_active if n != slot]
+        host = self._host_of(sprite)
+        geometry = (self._sprite_geometry(sprite, host.bounds)
+                    if host is not None else None)
+        if config_dir and slot and geometry:
+            self._save_child_geometry(sprite, slot=slot, geometry=geometry)
+        lib = self._spawned_libs.pop(sprite, None)
+        # 菜单缩略图缓存挂壳上、按库身份分键：这只宠退出即定向摘掉它自己的条目
+        # （只摘它的，不动同壳其他宠的图；死条目留着只占 128 条上限）。
+        self._drop_menu_icon_cache_for(lib)
+        if sprite in self._spawned:
+            self._spawned.remove(sprite)
+        # 目标悬空：这只若正被共享控制器写角，先结清（它马上就不在窗里了）
+        self._settle_golden_spin_if_target(sprite)
+        if host is not None:
+            host.overlay.remove_sprite(sprite)
+        self._close_self_talk_host(sprite)
+        # 承载气泡收口期：同 _exit_main_pet（先摘引用 + 关闸，再关气泡）；
+        # 走的正是承载宠时才摘引用（不是载体就不动副本）
+        if sprite is self._alert_presenter:
+            self._alert_detach_copy()
+        self._alert_copy_teardown = True
+        try:
+            self._close_sprite_bubble(sprite)
+        finally:
+            self._alert_copy_teardown = False
+        self._sprite_hosts.pop(sprite, None)
+        self._sprite_cfg_cache.pop(sprite, None)
+        shutdown = getattr(lib, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                logging.exception("overlay: 子肥鱼素材库收尾失败")
+        # 这只若是当前提醒的承载宠：整条交接到仍可见的宠（或在无宠时留待恢复）
+        self._sync_alert_copy()
+        # 这块屏上最后一只走了：那张窗口一并收掉（有其它屏的宠就不动驱动器）
+        self._reap_empty_hosts()
+
+    def clear_spawned_pets(self) -> None:
+        """退出全部子肥鱼（app.py clear_spawned_pets 语义）：逐只出活跃清单
+        （slot 配置保留），最后清单落盘为空——退出即不再复活（D5）。"""
+        for sprite in list(self._spawned):
+            self._remove_spawned_sprite(sprite)
+        self._spawned = []
+        self._persist_active_slots()
+        self._refresh_tray_menu()
+
+    def save_spawned_positions(self) -> None:
+        """退出收口：逐只按各自 slot 身份持久化几何（重启复活的位置来源）。"""
+        config_dir = self._spawn_config_dir()
+        if not config_dir:
+            return
+        for sprite in list(self._spawned):
+            slot = self._spawned_slots.get(sprite)
+            host = self._host_of(sprite)
+            geometry = (self._sprite_geometry(sprite, host.bounds)
+                        if host is not None else None)
+            if slot and geometry:
+                self._save_child_geometry(sprite, slot=slot, geometry=geometry)
+
+    def exit_pet(self, sprite=None) -> bool:
+        """退出单只（菜单「退出这只」的 overlay 落点）。
+
+        只移除目标活跃身份，档案保留；slot0与子宠同样可逆，不提升、不退出应用。
+        """
+        target = self.sprite if sprite is None else sprite
+        if target is self.sprite:
+            return self._exit_main_pet()
+        if target in self._spawned:
+            self._remove_spawned_sprite(target)
+            self._persist_active_slots()
+            self._refresh_tray_menu()
+            return True
+        return False
+
+    def _exit_main_pet(self) -> bool:
+        """关闭slot0的呈现资源，保留其档案、共享服务与所有子身份。"""
+        if self.sprite is None:
+            return False
+        self.save_position()
+        old_main, old_lib = self.sprite, self.lib
+        host = self._host_of(old_main)
+        self._settle_golden_spin_if_target(old_main)
+        if host is not None:
+            host.overlay.remove_sprite(old_main)
+        self._close_self_talk_host(old_main)
+        # 承载气泡收口期：先摘副本引用 + 关闸，免得关闭动作的 hidden 信号把
+        # "这只宠走了"当成"提醒被收起"，在濒死的气泡上再挂一次（重放）。
+        # 只有走的正是承载宠时才摘引用：不是载体就不该动副本（免得白重挂一次）。
+        if old_main is self._alert_presenter:
+            self._alert_detach_copy()
+        self._alert_copy_teardown = True
+        try:
+            self._close_sprite_bubble(old_main)
+            follower = getattr(self, "_bubble_follower", None)
+            if follower is not None:
+                follower.close()
+        finally:
+            self._alert_copy_teardown = False
+        self._bubble_follower = None
+        self._sprite_cfg_cache.pop(old_main, None)
+        self._spawned_slots.pop(old_main, None)
+        self._sprite_hosts.pop(old_main, None)
+        self.sprite = self.lib = None
+        timer = getattr(self, "_self_talk_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._self_talk_enabled = False
+        self._remembered_active = [n for n in self._remembered_active if n != 0]
+        self._delete_runtime_marker()
+        self._shutdown_library(old_lib, "slot0")
+        self._persist_active_slots()
+        self._refresh_tray_menu()
+        # 承载宠退出：当前提醒整体交接到仍可见的宠上（同 ID、同剩余 TTL、一份副本）
+        self._sync_alert_copy()
+        # 这块屏上最后一只走了：那张窗口一并收掉（最后一张窗口留着，见 _reap_empty_hosts）
+        self._reap_empty_hosts()
+        return True
+
+    def _rebind_main_sprite(self) -> None:
+        """恢复slot0后重挂其位置监听、投喂、气泡与标记。"""
+        host = self.host_for_sprite(self.sprite)
+        if self.sprite is not None:
+            self._bind_position_listener(self.sprite)
+        self._bind_feeding(host)
+        self._sprite_hosts.pop(self.sprite, None)
+        self._bind_bubble()
+        # 点击气泡族：主身份提升后回调仍指本壳（overlay 未变，重挂=幂等对齐）
+        host.overlay._on_sprite_click = self._on_sprite_click
+        self._sync_runtime_marker()
+
+    # ---------------------------------------------------------------- D7 设置进程避让标记
+    def _sync_runtime_marker(self) -> None:
+        """写 runtime 标记（设置进程避让读它）：主 sprite 身体框的全局几何。
+
+        原点取**主宠所在屏**的窗口（多屏下主宠可能不在主宿主上），否则设置进程
+        会去避让一块屏上的错误坐标。
+        """
+        try:
+            body = self.sprite.body_rect()
+            origin = self._sprite_origin(self.sprite)
+            slot_manager.write_runtime_marker(
+                self._config.dir, self._config.instance_id,
+                origin.x() + body.x(), origin.y() + body.y(),
+                body.width(), body.height(), versioned=True)
+        except Exception:
+            logging.debug("overlay: 写 runtime 标记失败", exc_info=True)
+
+    def _on_main_sprite_moved(self, _sprite) -> None:
+        now = time.monotonic()
+        if now - self._last_marker_write < 1.0:  # 1Hz 节流
+            return
+        self._last_marker_write = now
+        self._sync_runtime_marker()
+
+    def _delete_runtime_marker(self) -> None:
+        try:
+            slot_manager.delete_runtime_marker(
+                self._config.dir, self._config.instance_id)
+        except Exception:
+            logging.debug("overlay: 删 runtime 标记失败", exc_info=True)
+
+    # ---------------------------------------------------------------- D12 指令通道
+    def _install_settings_command_watch(self) -> None:
+        """装 D12 指令消费：config 目录 watcher + 3s 轮询兜底（不新起线程）。
+
+        「独立设置进程写指令文件 → 主进程消费」的消费侧，机制与 app.py
+        ``_install_config_watcher`` 同款：QFileSystemWatcher 盯目录（原子
+        ``os.replace`` 会在目录里产生事件）+ QTimer 轮询兜底（网络盘/换 inode
+        等场景可能漏事件，轮询是保底；与 ``_settings_watch_timer`` 同 3s 节奏）。
+        无 config 目录（假配置对象 / 目录不可建）时整条链不装——与
+        ``_spawn_config_dir()`` 的既有防御一致，绝不在测试替身上抛。
+        """
+        config_dir = self._spawn_config_dir()
+        if not config_dir:
+            return
+        from PySide6.QtCore import QFileSystemWatcher
+
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logging.warning("overlay: 配置目录不可创建，跳过指令通道: %s", config_dir)
+            return
+        watcher = QFileSystemWatcher(self)
+        watcher.directoryChanged.connect(self._on_settings_command_dir_changed)
+        if not watcher.addPath(str(config_dir)):
+            logging.warning("overlay: 无法监视配置目录，指令通道退化为轮询: %s",
+                            config_dir)
+        self._command_watcher = watcher
+        self._command_timer.setInterval(3000)
+        self._command_timer.timeout.connect(self._on_settings_command_poll)
+        self._command_timer.start()
+        # 启动即消费：设置进程可能在主进程起来之前就写下了指令（保鲜窗口内有效）
+        self._consume_settings_command()
+
+    def _on_settings_command_dir_changed(self, _path: str) -> None:
+        self._consume_settings_command()
+        self._refresh_slot_settings_if_changed()
+
+    def _slot_config_signatures(self) -> dict:
+        """活跃子宠 slot 配置的 ``(mtime_ns, size)`` 签名（只 stat、不读内容）。
+
+        **已知局限**：同一文件两次改动若 mtime 与 size 都相同（粗粒度文件系统
+        时间戳、同长度改写），签名不变 → 这次改动会被漏掉，直到下一次有可观测
+        差异的写入或重启。这里只做"便宜的筛噪"，不引入内容哈希/版本号框架。
+        """
+        config_dir = self._spawn_config_dir()
+        if not config_dir:
+            return {}
+        signatures: dict = {}
+        for slot in {0, *self._active_slots()}:
+            try:
+                stat = overlay_spawn_state.slot_config_path(
+                    config_dir, slot).stat()
+            except OSError:
+                signatures[int(slot)] = None
+                continue
+            signatures[int(slot)] = (stat.st_mtime_ns, stat.st_size)
+        return signatures
+
+    def _refresh_slot_settings_if_changed(self) -> None:
+        """配置目录有变动时：活跃 slot 的配置**真变了**才重读（内容读只在事件边界）。
+
+        目录事件不带文件名（runtime 标记、settings.lock 等也会触发），所以先用
+        stat 签名筛掉噪声，命中变化的 slot 才重读内容并把它那份设置下发到**对应
+        的那只**子肥鱼（旧契约：设置保存即覆盖该宠运行态；见
+        ``window.py:3928-4033`` 的逐窗 refresh）。
+
+        窄契约（不出圈）：只有**签名变了的那几个 slot** 会被重读/重下发，其余
+        子宠的运行态一个键都不碰——目录事件不该顺手把别的宠刷成主配置值。
+        B7b 之前这里只重算碰撞资格位；现在同一入口按各自 slot 文件下发全套
+        per-slot 键（``_apply_sprite_settings_to``）+ 重算资格位。
+
+        没有子宠 / 没有 config 目录 → 立即返回，零 I/O；签名只 stat 不读文件，
+        且只在目录事件与既有 3s 兜底轮询上跑（不逐帧、不新起线程、不动 tick）。
+        """
+        signatures = self._slot_config_signatures()
+        previous = getattr(self, "_slot_signature_cache", None) or {}
+        self._slot_signature_cache = signatures
+        if previous == signatures:
+            return
+        changed = {slot for slot, sig in signatures.items()
+                   if previous.get(slot) != sig}
+        # 首次（无缓存）或签名真的变了 → 读 slot 配置内容（内容读只在这里发生）
+        logging.info("overlay: 子肥鱼 slot 配置有变更 → 按各自配置重下发设置 %s",
+                     sorted(changed))
+        for slot in changed:
+            if not self._apply_child_profile(slot):
+                self._slot_signature_cache.pop(slot, None)
+
+    def _on_settings_command_poll(self) -> None:
+        """既有 3s 兜底轮询：指令消费 + 子宠 slot 设置变更检查（同为事件兜底）。"""
+        self._consume_settings_command()
+        self._refresh_slot_settings_if_changed()
+
+    def _consume_settings_command(self) -> None:
+        """消费一条设置进程指令（幂等；无指令 = 空转）。
+
+        指令语义：``exit_spawned_pets`` 的 ``target`` 为空 = 退出全部子肥鱼（设置页
+        「一键退出子肥鱼」），否则只退那个 slot 身份（身份已不在活跃清单 = 空操作，
+        只留日志）；``apply_settings_reset`` = 按刚写下的默认值对齐这一只的运行态
+        （见 :meth:`apply_settings_reset`）。
+        """
+        config_dir = self._spawn_config_dir()
+        if not config_dir:
+            return
+        command = overlay_settings_command.claim_command(config_dir)
+        if command is None:
+            return
+        retry = False
+        try:
+            name, target = command["command"], command["target"]
+            if name == overlay_settings_command.CMD_PROFILE_RESET:
+                if target is None or not 0 <= target <= overlay_spawn_state.MAX_SCAN_SLOTS:
+                    logging.warning("overlay: profile_reset target=%s 永久无效，失败结束", target)
+                elif not self._apply_child_profile(target):
+                    retry = True
+                    logging.warning("overlay: profile_reset slot-%s 未应用，保留有界重试", target)
+                else:
+                    logging.info("overlay: profile_reset slot-%s 已同步（位置保留/关闭目标不复活）", target)
+            elif name == overlay_settings_command.CMD_APPLY_SETTINGS_RESET:
+                self.apply_settings_reset(target)
+            elif target is None:
+                self.clear_spawned_pets()
+            else:
+                sprite = next((item for item in self._spawned
+                               if self._spawned_slots.get(item) == target), None)
+                if sprite is not None:
+                    self.exit_pet(sprite)
+                else:
+                    logging.info("overlay: 指令目标 slot-%s 已关闭，空操作结束", target)
+        except Exception:
+            retry = True
+            logging.exception("overlay: 指令应用失败，保留有界重试")
+        finally:
+            overlay_settings_command.finish_command(config_dir, command, retry=retry)
+
+    def apply_settings_reset(self, slot=None) -> None:
+        """全局reset只重读全局能力与world参数，不动任何宠档案或位置。"""
+        self._config.reload()
+        self._apply_window_capabilities()
+        self._sync_collision_physics(self._config)
+
+    def _teardown_settings_command_watch(self) -> None:
+        """释放指令 watcher 与轮询定时器（stop / aboutToQuit / 测试收口共用）。"""
+        watcher = getattr(self, "_command_watcher", None)
+        if watcher is not None:
+            try:
+                watcher.directoryChanged.disconnect(
+                    self._on_settings_command_dir_changed)
+            except (RuntimeError, TypeError):
+                pass
+            watcher.setParent(None)
+            watcher.deleteLater()
+            self._command_watcher = None
+        timer = getattr(self, "_command_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
+    # ---------------------------------------------------------------- D13 逐 sprite 设置路由
+    def sprite_instance_id(self, sprite) -> str:
+        """sprite 的 config 身份：主 sprite = ``slot-0``，子 sprite = 各自 slot 身份。
+
+        D13：独立设置进程按 ``--instance`` 打开对应 ``config-slot-N.json``；主宠的
+        档案身份就是 ``slot-0``（身份空间含 0），故主/子走同一条显式身份通路。
+        陌生 sprite（不在登记表）回退 ``slot-0``，绝不瞎猜 slot。
+        """
+        main_id = "slot-0"
+        if sprite is None or sprite is self.sprite:
+            return main_id
+        slot = self._spawned_slots.get(sprite)
+        if slot is None:
+            return main_id
+        return slot_manager.slot_to_instance_id(int(slot))
+
+    def open_settings_for(self, sprite=None) -> bool:
+        """按被点 sprite 的 config 身份打开设置页（D13 落点）。
+
+        返回 True = 已交给独立设置进程（与 ``AppShell.open_settings_process``
+        同义）。只认 AppShell 的 opener：拿不到（测试替身）或开关关闭 → False；
+        overlay 拓扑没有 PetWindow 可挂 parent，故不做进程内回退。
+
+        交不出去时必须给可见反馈（``_notify_settings_unavailable``）：菜单项看着
+        可用、点下去毫无反应是最难自查的一类"坏了"。
+        """
+        opener = getattr(getattr(self._instance, "shell", None),
+                         "open_settings_process", None)
+        if not callable(opener):
+            return False
+        if bool(opener(_SettingsIdentity(self.sprite_instance_id(sprite)))):
+            return True
+        self._notify_settings_unavailable()
+        return False
+
+    def _notify_settings_unavailable(self) -> None:
+        """设置进程交不出去时的可见反馈（气泡说明 + 日志）。
+
+        **为什么是气泡而不是"菜单项置灰 + tooltip"**：``settings_process_isolation``
+        在设置界面没有任何入口，置灰只说明"不可用"、说不出原因，用户也没有补救
+        路径；tooltip 在 macOS 原生菜单上根本不显示，而 mac 正是这条缺陷家族的
+        主战场（legacy 拓扑有进程内设置窗兜底，只有 overlay 会走到这里）。反馈收
+        在 ``open_settings_for``（唯一路由点）→ 托盘、右键 facade 的
+        ``on_open_modern_settings`` / ``on_open_settings`` 三条入口自动都有；置灰
+        得在每个菜单构建处各写一遍，且构建期冻结的状态在用户改完 config.json 后
+        就是错的（该键改动无需重启）。
+
+        文案按原因分两种，并点名 config 键（用户能在 config.json 里改回来）。
+        """
+        if not bool(self._config.get("settings_process_isolation", True)):
+            reason = ("config.json 里的 settings_process_isolation 被关掉了，"
+                      "改回 true 再点一次")
+        else:
+            reason = "独立设置进程没拉起来，稍后重试或看日志"
+        logging.warning("overlay: 桌宠设置未打开（%s）", reason)
+        self.show_bubble(f"桌宠设置没打开：{reason}", duration_ms=6000)
+
+    def _sprite_visible(self, sprite) -> bool:
+        """sprite 当前可见性（M14）；无该字段的鸭式 sprite 视为可见。"""
+        return bool(getattr(sprite, "visible", True))
+
+    def set_sprite_visible(self, sprite, visible: bool) -> None:
+        """逐只显隐（M14）：只改该 sprite 的 visible，不动整窗显隐语义。
+
+        整窗显隐仍归 ``set_pet_visible``（overlay.show/hide + 岛状态同步）；
+        逐只是"这一只退出合成与交互面"，两者互不联动。隐藏走 sprite 既有脏
+        矩形通道，overlay 立即擦除残留。
+
+        隐藏时同时收**这一只自己的**气泡（旧机 ``window.py:1160-1237``：
+        逐宠 ``hide()`` → ``_pause_activity`` → ``bubble.hide()``）。不收的话
+        气泡会继续浮在桌面上直到自身停留计时结束（最长时长 + 2s），且因该只
+        已不可见，位置扇出早退——气泡停在原地不动。B7b 起子宠也有自己的气泡，
+        故逐只收气泡对所有 sprite 生效（隐藏子宠不影响主宠的气泡）。
+
+        A5：用户主动隐藏**主**宠（= 整窗？不，逐只隐藏主宠）时给托盘提示——
+        旧机 ``on_hidden`` 由 app 注入（``app.py:545``），overlay 下托盘挂在壳
+        上、``AppShell.tray`` 恒为 None，故由壳自己走那条通知（getattr 探测，
+        不改 app.py）。
+
+        O3：显隐同时切换该 sprite 的播放节拍（隐藏 → ``pause_clip``，显示 →
+        ``resume_clip``），并把"可见 sprite 数变化"通知驱动器——藏光最后一只
+        可见 sprite 时目标档位是 T3（没有像素要上屏），恢复可见则同步回全速。
+
+        恢复侧先过**有效可播**闸门（``_clips_playable``）：暂停有两个独立所有者
+        （本壳的整窗显隐 + 驱动器的锁屏挂起），"这次是谁解除的"不足以判定该放行
+        ——整窗隐藏中托盘勾「显示这只」、锁屏挂起中全屏避让解除，都会让 clip 在
+        不可见/挂起期重新按帧率解码。sprite 的 ``visible`` 照改（它逻辑上仍是
+        可见宠物，只是窗口/屏幕不显示），被压住的播放节拍等窗口真正可见时由
+        整窗显示路径补放行。
+        """
+        if sprite is None:
+            return
+        setter = getattr(sprite, "set_visible", None)
+        if callable(setter):
+            setter(bool(visible))
+        else:
+            sprite.visible = bool(visible)
+        # O3：隐藏的那一只停播放节拍（clip 定时器），显示则从暂停处续播——
+        # 隐藏 sprite 既不绘制也不进 fanout，继续按帧率解码纯属白烧 CPU；
+        # 恢复**不**重启动画（不回第 0 帧、无首帧冷启动）。
+        # 恢复放行 = 这一只被标为可见 **且** 窗口真的能上屏（有效可播闸门）；
+        # 闸门关着时按暂停方向走（幂等，不打断既有的整窗暂停）。
+        self._set_sprite_clip_paused(
+            sprite, not (visible and self._clips_playable()))
+        if not visible:
+            # 逐只隐藏的收口期：承载宠被藏时先摘副本引用 + 关闸，隐藏该只气泡的
+            # hidden 信号不得把"这只被藏了"当成"提醒被收起"而在它自己头上重挂一次
+            # （不是载体就不动副本，免得白重挂一次）。
+            if sprite is self._alert_presenter:
+                self._alert_detach_copy()
+            self._alert_copy_teardown = True
+            try:
+                self._hide_bubble_for_sprite(sprite)
+            finally:
+                self._alert_copy_teardown = False
+            if sprite is getattr(self, "sprite", None):
+                self._notify_pet_hidden()
+        self._sync_tray_pet_visibility()
+        # 可见 sprite 数变化 → 档位机立即重评（零可见 sprite 的目标档位是 T3）
+        self._note_sprite_visibility_changed()
+        # 承载宠被藏（或在无宠期重新可见）：提醒交接 / 恢复走同一漏斗
+        self._sync_alert_copy()
+
+    @staticmethod
+    def _set_sprite_clip_paused(sprite, paused: bool) -> None:
+        """逐只播放节拍暂停/恢复（clip 无该接口的鸭子 sprite 静默跳过）。"""
+        name = "pause_clip" if paused else "resume_clip"
+        call = getattr(sprite, name, None)
+        if callable(call):
+            call()
+
+    def _clips_playable(self) -> bool:
+        """有效可播（O3 恢复路径的统一闸门）：有窗口可见 **且** 驱动器未挂起。
+
+        暂停有两个独立所有者——本壳（整窗显隐/全屏避让）与驱动器（锁屏挂起）。
+        恢复路径只看"这次是谁解除的"就会替另一个所有者擅自放行：整窗隐藏中
+        托盘勾「显示这只」、锁屏中全屏避让解除，都会让 clip 在不可见/挂起期
+        重新按帧率解码（O3 契约破坏）。多屏下是"任一窗口可见"：一整组窗口全隐藏
+        才没有像素要上屏。
+        """
+        try:
+            if not self._any_host_visible():
+                return False
+        except RuntimeError:
+            return False  # 原生窗口已销毁：没东西可上屏
+        driver = getattr(self, "driver", None)
+        return not bool(getattr(driver, "suspended", False))
+
+    def _set_all_clips_paused(self, paused: bool) -> None:
+        """整窗隐藏/显示：逐 sprite 停/续播放节拍（O3）。
+
+        恢复侧跳过**逐只被隐藏**的 sprite（``visible`` 为假）：整窗显示不等于
+        这一只该醒——否则"托盘藏起子肥鱼 → 隐藏整窗 → 显示整窗"会让那只又开始
+        按帧率解码（隐藏 sprite 的播放节拍暂停被窗口显隐悄悄解除）。逐只恢复
+        仍归 ``set_sprite_visible(True)``。
+
+        恢复侧还要过有效可播闸门：本方法的调用点里，全屏避让解除发生在锁屏
+        挂起期间（``overlay.show()`` 已走完、可见性判据不再拦得住），挂起未解除
+        时整批不许放行。
+        """
+        if not paused and not self._clips_playable():
+            return
+        for sprite in list(getattr(self.overlay, "sprites", ())):
+            if not paused and not self._sprite_visible(sprite):
+                continue
+            self._set_sprite_clip_paused(sprite, paused)
+
+    def _note_sprite_visibility_changed(self) -> None:
+        """把"可见 sprite 数变化"通知驱动器（同 ``note_sprite_count_changed`` 面）。"""
+        note = getattr(self.driver, "note_sprite_visibility_changed", None)
+        if callable(note):
+            note()
+
+    def toggle_sprite_visible(self, sprite=None) -> None:
+        """逐只显隐切换（托盘逐只菜单入口）；sprite=None = 主宠。"""
+        target = self.sprite if sprite is None else sprite
+        if target is None:
+            return
+        self.set_sprite_visible(target, not self._sprite_visible(target))
+
+    def _sync_tray_pet_visibility(self) -> None:
+        """托盘弹出前/显隐变更后同步逐只勾选态（外部也可能改过 sprite.visible）。"""
+        for sprite, action in list(getattr(self, "_pet_visible_actions", [])):
+            try:
+                action.setChecked(self._sprite_visible(sprite))
+            except RuntimeError:
+                continue  # 菜单已销毁（wrapper 失效）：跳过
+
+    def set_pet_visible(self, visible: bool) -> None:
+        """显隐切换（app.py toggle_visible 等价）+ 岛状态同步 + 共享子系统 pause/resume。
+
+        4.3 后半：显隐钩子上接主动识屏/联动监视器的 pause/resume
+        （``window.py:1214-1250`` 语义）。隐藏时也收起气泡；恢复时把仍挂着的
+        粘滞提醒重新挂上（legacy ``_resume_activity`` 同款）。
+
+        自言自语定时器与显隐对称（``window.py:1183`` / ``:1240``）：隐藏期间
+        停表（不可见壳不冒泡），恢复显示时重排下一次。
+
+        音乐自动唱歌轮询同样对称（window.py:1145-1147 / :1241-1242）：隐藏
+        停表、恢复显示按开关重启。
+
+        O3：整窗隐藏/显示同时逐 sprite 停/续播放节拍，并把主库与**全部**子宠库
+        的动画预热 ``pause_warm`` / ``resume_warm`` 成对切换（旧机 ``hide()`` →
+        ``_pause_activity`` → ``lib.pause_warm()`` 的等价链，``window.py:1214-1248``）；
+        隐藏期预热没有可见收益，却仍在派生 ffmpeg。恢复侧在 ``overlay.show()``
+        之后同一分支内补回。
+        """
+        if visible:
+            self._show_all_hosts()
+            for host in self._hosts:
+                if host.probe is not None:
+                    host.probe.resume()
+            if self._alert_current is not None:
+                # 队列提醒（含已迁移到子宠的）整窗恢复也走承载宠漏斗：legacy
+                # `_sticky_*` 重挂会把同一条提醒在"当前目标"上再挂一份
+                self._sync_alert_copy()
+            else:
+                self._restore_sticky_bubble()
+                if self._alert_queue:
+                    # 隐藏期排队等着的提醒（隐藏期间 resolved 掉 current、或
+                    # current 到点收口）：显示恢复时接着推进，不靠"下一次新提醒"
+                    # 才把它捞出来（pump 自带可见性/门禁复判，被挡就原地等着）
+                    self._pump_alerts()
+            self._resume_shared_subsystems()
+            if getattr(self, "_self_talk_timer", None) is not None:
+                self._schedule_self_talk()
+            self._resume_all_self_talk_hosts()   # 子宠各自的计时同样恢复
+            self.sync_music_sing()
+            self._set_all_clips_paused(False)
+            self._resume_warm_all()
+            self._note_sprite_visibility_changed()
+        else:
+            timer = getattr(self, "_self_talk_timer", None)
+            if timer is not None:
+                timer.stop()
+            self._stop_all_self_talk_hosts()
+            self._stop_music_sing_polling()
+            self._hide_bubble_for_visibility()
+            self._hide_all_hosts()
+            for host in self._hosts:
+                if host.probe is not None:
+                    host.probe.pause()
+            self._pause_shared_subsystems()
+            self._set_all_clips_paused(True)
+            self._pause_warm_all()
+            # A5：用户主动隐藏 → 托盘提示怎么恢复（旧机 app 注入 on_hidden 的等价物）
+            self._notify_pet_hidden()
+            self._note_sprite_visibility_changed()
+        island = getattr(getattr(self._instance, "shell", None), "island", None)
+        if island is not None:
+            try:
+                island.set_pet_visible(bool(visible))
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------- 预热成对（O3）
+    def _all_libraries(self) -> list:
+        """主库 + 全部子宠库（每只子肥鱼各持独立库，M8；None 已摘除的跳过）。"""
+        libs = []
+        main = getattr(self, "lib", None)
+        if main is not None:
+            libs.append(main)
+        libs.extend(lib for lib in getattr(self, "_spawned_libs", {}).values()
+                    if lib is not None)
+        return libs
+
+    def _pause_warm_all(self) -> None:
+        """隐藏/挂起 → 逐库停预热（在飞首帧预热线程一并收口，见 library.pause_warm）。"""
+        for lib in self._all_libraries():
+            pause = getattr(lib, "pause_warm", None)
+            if not callable(pause):
+                continue
+            try:
+                pause()
+            except Exception:
+                logging.debug("overlay: 暂停动画预热失败", exc_info=True)
+
+    def _resume_warm_all(self) -> None:
+        """显示/唤醒 → 逐库补预热（与 ``_pause_warm_all`` 严格成对）。"""
+        for lib in self._all_libraries():
+            resume = getattr(lib, "resume_warm", None)
+            if not callable(resume):
+                continue
+            try:
+                resume()
+            except Exception:
+                logging.debug("overlay: 恢复动画预热失败", exc_info=True)
+
+    def _notify_pet_hidden(self) -> None:
+        """用户主动隐藏桌宠 → 托盘提示（说明怎么恢复）。
+
+        旧机由 app 注入 ``win.on_hidden``（``app.py:545`` → ``_notify_pet_hidden``，
+        实现读 ``shell.tray``）；overlay 拓扑下托盘挂在**壳**上（``AppShell.tray``
+        恒为 None）、注入链也不存在，故由壳直接调实例上的同一个方法（getattr 探测：
+        测试替身/精简装配静默跳过，绝不因提示失败拖垮隐藏动作）。
+        """
+        notify = getattr(self._instance, "_notify_pet_hidden", None)
+        if not callable(notify):
+            return
+        try:
+            notify()
+        except Exception:
+            logging.debug("overlay: 隐藏提示失败", exc_info=True)
+
+    def _hide_bubble_for_visibility(self) -> None:
+        """整窗隐藏期收起**全部**气泡（气泡是置顶 Tool 窗，不随 overlay 隐藏）。"""
+        followers = [getattr(self, "_bubble_follower", None)]
+        followers.extend(list(self._bubble_followers.values()))
+        for follower in followers:
+            if follower is not None:
+                follower.hide()
+
+    def _restore_sticky_bubble(self) -> None:
+        """恢复显示：仍挂着的粘滞提醒重新挂上（legacy ``_resume_activity`` 同款）。"""
+        if not self._sticky_bubble_active or not self._sticky_text:
+            return
+        if self._speech_bubble is None:
+            return
+        self._show_bubble_text(self._sticky_text, 0,
+                              subtitle=self._sticky_subtitle, sticky=True,
+                              buttons=self._sticky_buttons)
+
+    def _toggle_pet_visible(self) -> None:
+        self.set_pet_visible(not self._any_host_visible())
+
+    def _host_for_collision(self, event):
+        """撞出这一事件的成员在哪块屏的宿主上（找不到 → 主宿主）。
+
+        事件只带成员 id（``SpriteCollisionWorld._member_id``），多屏下同一个 id
+        只可能出现在一块屏的成员表里；找不到（纯静态成员对，实际不会发生）时
+        退回主宿主，绝不猜屏。
+        """
+        from .sprite_collision import SpriteCollisionWorld
+        ids = (getattr(event, "a", None), getattr(event, "b", None))
+        for host in self._hosts:
+            for sprite in host.overlay.sprites:
+                if SpriteCollisionWorld._member_id(sprite) in ids:
+                    return host
+        return self._main_host
+
+    def _on_collision_sound(self, event) -> None:
+        """碰撞音效（进程级共享播放器）：按事件所在屏的世界过岛击闸门。
+
+        播放器只持一个缺省世界（主宿主），故这里把"撞出这一事件的那块屏的世界"
+        显式传进去——副屏的岛击才不会被主屏的静态成员表漏判成普通对阈值。
+        """
+        host = self._host_for_collision(event)
+        world = host.collision if host is not None else None
+        self._sound.on_collision(event, world=world)
+
+    def _on_collision_squash(self, event) -> None:
+        """碰撞 Q 弹（旧权威冲量路径的 squash 语义）：真撞击量级时
+        双方 sprite 各压一次。runtime_id 反查 sprite（成员少，线性即可）。
+
+        只在**撞出这一事件的那块屏**的成员里反查：多屏下主/副屏各有成员表，
+        拿主宿主的表查副屏事件会认错对象（撞的是同名 id 的另一只）。
+
+        不再用 hit_min_dv 二次过滤：CollisionEvent 只在真撞击时 fire，
+        且阈值已按 pair 类型分级（普通 300 / 撞静态成员 60 / thrown 任意）——
+        壳层再按 300 卡一刀会把 60-300 的岛撞（合法真撞击）整段截掉
+        （旧机低速撞岛也会挤压）。
+        """
+        from .sprite_collision import SpriteCollisionWorld
+        host = self._host_for_collision(event)
+        for sprite in host.overlay.sprites:
+            if SpriteCollisionWorld._member_id(sprite) in (event.a, event.b):
+                squash = getattr(sprite, "squash", None)
+                if callable(squash):
+                    squash()
+
+    def _on_collision_probe(self, event) -> None:
+        """碰撞真撞击 → 边缘探头取消会话（旧机 collision_client 取消链语义）
+        + throw_egg arm（探头被撞飞头部跟随速度）。
+
+        arm 只认「本次真取消了活跃探头会话」这个显式事实（探头入口的返回
+        值）——探头侧的 5 秒重进倒计时会残留，不能反过来当证据。
+
+        探头/彩蛋走**撞出这一事件的那块屏**自己的那份（逐屏一份），成员也只看
+        那块屏的。
+
+        同 _on_collision_squash：不按 hit_min_dv 二次过滤（事件的阈值已按
+        pair 分级，岛撞 60-300 也是合法真撞击，旧机同样取消探头会话）。
+        """
+        from .sprite_collision import SpriteCollisionWorld
+        host = self._host_for_collision(event)
+        probe = host.probe
+        egg = host.throw_egg
+        if probe is None and egg is None:
+            return
+        for sprite in host.overlay.sprites:
+            if SpriteCollisionWorld._member_id(sprite) in (event.a, event.b):
+                cancelled = None
+                if probe is not None:
+                    cancelled = probe.on_sprite_collision_hit(sprite)
+                if egg is not None:
+                    egg.on_probe_collision_throw(
+                        sprite, probe_cancelled=cancelled)
+
+    def _say_feeding_bubble(self, result: dict, sprite=None) -> None:
+        """投喂气泡（file_eater 同文案格式；B02：落命中那只自己的气泡通道）。
+
+        壳上子宠气泡既有分发靠 ``_bubble_for(sprite)``（每只一只跟随器，见
+        ``_ensure_sprite_bubble``），这里不再新造通道：落点是子宠就发子宠那只。
+        """
+        from .file_eater import FEEDING_BUBBLE_SUBTITLE, feeding_bubble_text
+        follower = self._bubble_for(sprite)
+        if follower is None:
+            return
+        follower.say(feeding_bubble_text(result),
+                     subtitle=FEEDING_BUBBLE_SUBTITLE)
+
+    def switch_character(self, character_id: str, sprite=None) -> None:
+        """切换角色（4.1c）：换 per-pet 库 + 行为状态重置 + 配置持久化。
+
+        per-pet 库是 T3 定论：新建库给目标 sprite，旧库 shutdown 收尾 clip；
+        行为状态机 forget 后下个 tick 自动接管 bind（防旧 clip 跨库残留）。
+
+        ``sprite`` = 被点的那一只（B7b）：旧架构一窗一宠，菜单的「切换角色」只换
+        本窗、只写本窗的 cfg。主宠照旧（换 ``self.lib`` + 写主配置）；子宠换**它
+        自己的**库、写**它自己的** ``config-slot-N.json['character']``——此前一律
+        打在主宠身上（审计 F1），子宠各自存的角色也无人读。
+
+        切完主宠还要收口两处跨角色的派生状态：菜单动画缩略图缓存（B08，同名动画
+        跨角色串图）与各聊天面的角色上下文（B07，切完再开口仍是旧角色）。
+        """
+        target = self.sprite if sprite is None else sprite
+        if target is None:
+            if sprite is None and character_id and self._slot_writer(0)("character", character_id):
+                self._sprite_cfg_cache.pop(None, None)
+                self._sync_chat_surfaces(character_id)
+            return
+        if target is not self.sprite:
+            self._switch_child_character(target, character_id)
+            return
+        current = str(self._sprite_config(target).get("character", catalog.DEFAULT_CHARACTER))
+        if not character_id or character_id == current:
+            return
+        egg = self.host_for_sprite(target).throw_egg
+        if egg is not None:
+            egg.cancel_all("character_switch")  # 换角色即换素材，飞行会话兜底回正
+        try:
+            new_lib = self._instance._create_library(character_id)
+        except Exception:
+            logging.exception("overlay: 切换角色建库失败 %s", character_id)
+            return
+        if not self.persist_sprite_setting(target, "character", character_id):
+            self._shutdown_library(new_lib, "character-save-failed")
+            return
+        target._profile_character = character_id
+        old_lib = self.lib
+        self.lib = new_lib
+        self.sprite.library = new_lib
+        self.host_for_sprite(self.sprite).behavior.forget(self.sprite)
+        self._clear_menu_icon_cache()
+        self._sync_chat_surfaces(character_id)
+        # 换库 = 换 body_box：锚点取材于 ``catalog.character_body_box``（体框变了
+        # 但 rect 可能没变，位置扇出只在 old != new 时通知），必须显式刷新一次，
+        # 否则同一位置下气泡挂在旧角色的锚点上直到下一次真实位移。
+        follower = getattr(self, "_bubble_follower", None)
+        refresh_anchor = getattr(follower, "refresh_anchor", None)
+        if callable(refresh_anchor):
+            try:
+                refresh_anchor()
+            except Exception:
+                logging.debug("overlay: 换角色后气泡锚点刷新失败", exc_info=True)
+        shutdown = getattr(old_lib, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                logging.exception("overlay: 旧素材库收尾失败")
+
+    def _drop_menu_icon_cache_for(self, library) -> None:
+        """定向摘掉某个素材库的菜单缩略图条目（退出子肥鱼用）。
+
+        缓存挂壳上、键 =（库身份, 动画名）：一份缓存服务同壳所有宠，所以这里按库身份
+        只摘这只宠的条目——整份清掉（``_clear_menu_icon_cache`` 的换角色语义）会把别的
+        宠的图一起丢掉，下次开菜单全部重解码。没开过菜单（缓存尚未创建）时不动作。
+        """
+        cache = getattr(self, "_menu_icon_cache", None)
+        if isinstance(cache, dict):
+            animation_icon_cache_drop_library(cache, library)
+
+    def _clear_menu_icon_cache(self) -> None:
+        """换角色后清菜单动画缩略图缓存（B08；复审#5 后是**内存卫生**）。
+
+        缓存挂壳上、键 =（库身份, 动画名）（``shared.animation_icon_cache_key``）：
+        同名动画与迟到写入都已由库身份隔开，整份清掉的余下价值是不让旧库的死项占着
+        128 条上限、也不给 ``id()`` 复用留机会。下次取图按新库重新解码；没开过菜单
+        （缓存尚未创建）时不动作。
+        """
+        cache = getattr(self, "_menu_icon_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
+
+    def _sync_chat_surfaces(self, character_id: str) -> None:
+        """把新角色同步到各聊天面（B07）：快速对话气泡 + 完整聊天窗/岛对话气泡。
+
+        聊天面的角色（会话、头像、系统提示）是各自的构造期快照，换素材库不会
+        连带更新。持久气泡与聊天窗由持有点按各自 ``switch_character`` 重建角色
+        上下文；未创建的聊天面无需同步（新建时按新配置构造）。同步失败只记录，
+        绝不能让已经完成的素材切换白做。
+        """
+        bubble = self._quick_chat
+        sync = getattr(bubble, "switch_character", None)
+        if callable(sync):
+            try:
+                sync(character_id)
+            except Exception:
+                logging.exception("overlay: 快速对话气泡角色同步失败")
+        surface_sync = getattr(self._instance, "sync_chat_character", None)
+        if callable(surface_sync):
+            try:
+                surface_sync(character_id)
+            except Exception:
+                logging.exception("overlay: 完整聊天窗/岛对话气泡角色同步失败")
+
+    def _switch_child_character(self, sprite, character_id: str, *, persist=True) -> bool:
+        """子宠换角色：换它自己的库 + 写它自己的 slot 配置（主宠一字不动）。
+
+        聊天面不在此同步（B07 调查结论）：快速对话气泡、完整聊天窗、岛对话气泡
+        的角色身份一律取**主配置**（``QuickChatBubble(self._config)``、会话目录按
+        主身份），子宠没有自己的聊天身份通道可言——把主宠的聊天面改成子宠的角色
+        只会错得更远。菜单缩略图缓存是壳级的（同名动画跨角色串图，B08），换库后
+        照清。
+        """
+        slot = self._spawned_slots.get(sprite)
+        current = getattr(sprite, "_profile_character", None)
+        if slot is None or not character_id:
+            return False
+        if character_id == current:
+            return True
+        center = QPointF(sprite.body_rect().center())
+        selected = character_id
+        try:
+            new_lib = self._instance._create_library(selected)
+        except FileNotFoundError:
+            selected = catalog.DEFAULT_CHARACTER
+            try:
+                new_lib = self._instance._create_library(selected)
+            except Exception:
+                logging.exception("overlay: 子宠默认角色建库失败")
+                return False
+        except Exception:
+            logging.exception("overlay: 子宠切换角色建库失败 %s", selected)
+            return False
+        if (persist or selected != character_id) and not self._slot_writer(slot)("character", selected):
+            self._shutdown_library(new_lib, "未应用角色")
+            return False
+        self._settle_golden_spin_if_target(sprite)
+        sprite_host = self.host_for_sprite(sprite)
+        egg = sprite_host.throw_egg
+        if egg is not None:
+            egg.cancel_all("character_switch")
+        old_lib = self.lib if slot == 0 else self._spawned_libs.get(sprite)
+        if slot == 0:
+            self.lib = new_lib
+            self._sync_chat_surfaces(selected)
+        else:
+            self._spawned_libs[sprite] = new_lib
+        sprite.library = new_lib
+        sprite._profile_character = selected
+        sprite_host.behavior.forget(sprite)
+        body = sprite.body_rect()
+        sprite.set_pos(QPointF(sprite.pos) + center - QPointF(body.center()))
+        if persist:
+            self._sprite_cfg_cache.pop(sprite, None)
+        self._clear_menu_icon_cache()
+        self._refresh_sprite_bubble_style(sprite)
+        self._shutdown_library(old_lib, "子宠旧角色")
+        return True
+
+    # ---------------------------------------------------------------- 跨屏：宿主移交
+    def _screen_at_global(self, point):
+        """全局坐标落在哪块屏上（不在任何屏上返回 None）。
+
+        逐屏按**真实几何矩形**判，不用包含空洞的并集矩形：错位拼接（副屏更高/
+        更宽）时并集会把两块屏之间的空洞算成"有显示器"。
+        """
+        x, y = int(point.x()), int(point.y())
+        for screen in QGuiApplication.screens():
+            try:
+                if screen.geometry().contains(x, y):
+                    return screen
+            except RuntimeError:
+                continue  # 屏已拔除（wrapper 失效）：跳过
+        return None
+
+    @staticmethod
+    def _screens_touch(a, b) -> bool:
+        """两块屏是否**真实相接**（共享一段正长度的边）。
+
+        只用几何矩形判：共享边必须有正长度（错开的角落不算相接），故外接矩形里的
+        屏间空洞不会被算成可通行。
+        """
+        ga, gb = a.geometry(), b.geometry()
+        vertical = (ga.x() + ga.width() == gb.x() or gb.x() + gb.width() == ga.x())
+        horizontal = (ga.y() + ga.height() == gb.y() or gb.y() + gb.height() == ga.y())
+        overlap_y = min(ga.y() + ga.height(), gb.y() + gb.height()) - max(ga.y(), gb.y())
+        overlap_x = min(ga.x() + ga.width(), gb.x() + gb.width()) - max(ga.x(), gb.x())
+        return (vertical and overlap_y > 0) or (horizontal and overlap_x > 0)
+
+    def _screen_touch_group(self, screen) -> list:
+        """与 ``screen`` 连通的相接屏组（含它自己；按相接关系传递闭包）。"""
+        screens = []
+        for candidate in QGuiApplication.screens():
+            try:
+                if candidate is not None:
+                    screens.append(candidate)
+            except RuntimeError:
+                continue
+        group = [screen]
+        frontier = [screen]
+        while frontier:
+            current = frontier.pop()
+            for candidate in screens:
+                if candidate in group or not self._screens_touch(current, candidate):
+                    continue
+                group.append(candidate)
+                frontier.append(candidate)
+        return group
+
+    def _seam_domain_rects(self, host) -> tuple:
+        """该宿主所在屏的跨屏合法域（overlay 局部坐标）：相接屏组的可用区。
+
+        **全局可用区减去本宿主窗的原点**：``_local_bounds`` 是"屏可用区减去**该屏自己**
+        的原点"（屏局部坐标），拿它再减宿主原点等于把原点减了两次——邻屏矩形会塌到
+        本屏位置上，域就形同虚设。
+
+        单屏（组里只有它自己）返回空元组 = 不需要开域。
+        """
+        group = self._screen_touch_group(host.screen)
+        if len(group) <= 1:
+            return ()
+        origin = host.overlay.geometry().topLeft()
+        rects = []
+        for screen in group:
+            rects.append(QRectF(screen.availableGeometry()).translated(
+                -origin.x(), -origin.y()))
+        return tuple(rects)
+
+    def _open_seam_domain(self, sprite) -> bool:
+        """拖拽跨屏：给这只**开放跨屏临时合法域**（相接屏组的可用区并集）。
+
+        开域只放宽、不移动：新域是旧域（本屏可用区）的超集，当前身体位置必然仍合法，
+        所以不需要补钳制。单屏（没有相接的屏）或关闭跨屏时不动作。
+        """
+        if sprite is None or not self._cross_screen_allowed:
+            return False
+        host = self._host_of(sprite)
+        if host is None:
+            return False
+        rects = self._seam_domain_rects(host)
+        if not rects:
+            return False
+        sprite.set_clamp_rects(rects)
+        return True
+
+    def _close_seam_domain(self, sprite) -> bool:
+        """收窄跨屏域：**只在身体已完整落在本屏可用区内**时收（否则就是一次钳制位移）。
+
+        返回是否真的收了域。
+        """
+        if sprite is None or getattr(sprite, "_clamp_rects", None) is None:
+            return False
+        host = self._host_of(sprite)
+        if host is None:
+            return False
+        if not self._body_inside(sprite, QRectF(host.bounds)):
+            return False
+        sprite.set_clamp_rects(None)
+        sprite.set_bounds(QRect(host.bounds))
+        return True
+
+    @staticmethod
+    def _rect_covers(outer: QRectF, inner: QRectF) -> bool:
+        """``inner`` 是否完整落在 ``outer`` 内（**含边界**）。
+
+        必须含边界：``set_pos`` 的钳制把贴边的身体正好压在可用区边上（body 底 ==
+        可用区底），用右侧/下侧开区间的判定会把"已经整块进来"判成否——跨屏移交与
+        收域都永远不成立。QRectF.contains(QRectF) 在浮点矩形上的边界语义不保证，
+        这里用显式比较。
+        """
+        return (outer.left() <= inner.left() and outer.top() <= inner.top()
+                and inner.left() + inner.width() <= outer.left() + outer.width()
+                and inner.top() + inner.height() <= outer.top() + outer.height())
+
+    @staticmethod
+    def _body_inside(sprite, rect: QRectF) -> bool:
+        """这只的身体框是否**完整**落在该矩形内（收域判据；两者同一坐标系）。
+
+        ``sprite.body_rect()`` **已经含 pos**（= rect 原点 + body_box），它就在当前
+        宿主的局部坐标里——再叠一次 ``pos`` 就是双重平移（把身体框算到屏外去）。
+        """
+        return OverlayShell._rect_covers(QRectF(rect), QRectF(sprite.body_rect()))
+
+    def _global_body_rect(self, sprite) -> QRectF | None:
+        """这只身体框的全局矩形（跨屏判据统一用它；body_rect 含 pos，只加窗口原点）。"""
+        host = self._host_of(sprite)
+        if host is None:
+            return None
+        return QRectF(sprite.body_rect()).translated(
+            host.overlay.geometry().topLeft())
+
+    def route_seam_after_advance(self) -> None:
+        """每 tick（全部 overlay advance 之后）的一次跨屏判定：**每 tick 每 sprite 一次**。
+
+        只处理"开了跨屏域"的 sprite（跨屏拖拽中/过渡中的那些）：没开域的都是常规
+        单屏宠物，这一步与它们无关。单屏或关闭跨屏时连遍历都不做。
+
+        收尾同步跨屏**只读投影**：身体跨出自己那块屏的那一部分由邻窗画出来。
+        """
+        if not self._cross_screen_allowed:
+            return
+        for host in list(self._hosts):
+            for sprite in list(host.overlay.sprites):
+                if getattr(sprite, "_clamp_rects", None) is None:
+                    continue
+                self._route_one_seam(sprite)
+        self._sync_seam_projections()
+
+    def _sync_seam_projections(self) -> None:
+        """跨缝这只的身体越过自己那块屏的那部分 → 邻窗的**只读投影**。
+
+        投影只在"身体确实越过本屏几何边界、且与邻屏几何相交"时存在（相接与否由
+        真实几何判，不穿过屏间空洞）；越界结束、域被收窄、或这只退场即摘掉——
+        邻居窗口随之可以回收（投影期间不许回收：见 ``_reap_empty_hosts``）。
+
+        邻窗按映射偏移重画同一只 sprite 的当前帧（脏区按映射后的矩形局部 update），
+        所以缝两侧的像素拼起来就是"这只宠"本来的样子。
+        """
+        wanted: dict = {}
+        for host in list(self._hosts):
+            for sprite in list(host.overlay.sprites):
+                if getattr(sprite, "_clamp_rects", None) is None:
+                    continue
+                body = self._global_body_rect(sprite)
+                if body is None:
+                    continue
+                owner_geo = QRectF(host.screen.geometry())
+                if self._rect_covers(owner_geo, body):
+                    continue  # 整块还在自己屏里：不需要投影
+                for screen in QGuiApplication.screens():
+                    try:
+                        geo = QRectF(screen.geometry())
+                    except RuntimeError:
+                        continue
+                    if screen is host.screen or not geo.intersects(body):
+                        continue
+                    target = self.host_for_screen(screen) or self._create_host(screen)
+                    offset = (QPointF(host.overlay.geometry().topLeft())
+                              - QPointF(target.overlay.geometry().topLeft()))
+                    wanted.setdefault(target, {})[sprite] = offset
+
+        for host in list(self._hosts):
+            overlay = host.overlay
+            keep = wanted.get(host, {})   # wanted 以**宿主**为键（不是 overlay）
+            for sprite in list(overlay._projections):  # noqa: SLF001 - 同模块协作面
+                if sprite not in keep:
+                    overlay.clear_projection(sprite)
+                    overlay.update(overlay.projection_rect(sprite))
+            for sprite, offset in keep.items():
+                overlay.set_projection(sprite, offset)
+                # 投影每 tick 都要跟着这只的动画/位移重画（它是别人的帧，本窗的
+                # sprite 脏通道覆盖不到它）；区域就是它在本窗里的外接矩形。
+                overlay.update(overlay.projection_rect(sprite))
+
+    def _route_one_seam(self, sprite) -> bool:
+        """单只一次的跨屏判定，判据全部取自**这一拍的实际身体位置**：
+
+        - 身体完整落在**另一块屏**的可用区内 → 移交宿主（原子换帧：位置/目标/样本
+          一律不变，中间不经任何单矩形钳制）；
+        - 身体完整落在**本屏**可用区内 → 收窄域（回到常规单屏钳制）；
+        - 身体跨在缝上 → 保持开域：**不动它**（视觉由相邻窗的投影负责）。
+
+        返回是否发生了移交。
+        """
+        if sprite is None or not self._cross_screen_allowed:
+            return False
+        host = self._host_of(sprite)
+        if host is None:
+            return False
+        body = self._global_body_rect(sprite)
+        if body is None:
+            return False
+        screen = self._screen_fully_containing(body)
+        if screen is None:
+            return False  # 跨缝：保持开域
+        if screen is host.screen:
+            # 还在拖拽中就不收域：通道要开满整场拖拽（拖到一半就收，等于跨不过去）。
+            # 松手之后（dragging 清零）身体若已完整落在本屏内才算过渡结束。
+            if not getattr(sprite, "dragging", False):
+                self._close_seam_domain(sprite)
+            return False
+        target = self.host_for_screen(screen) or self._create_host(screen)
+        self._transfer_sprite(sprite, host, target)
+        self._keep_seam_domain(sprite)
+        self._reap_empty_hosts()
+        return True
+
+    def _screen_fully_containing(self, body_global: QRectF):
+        """身体框**完整**落在哪块屏的可用区里（跨屏移交的唯一判据；含边界）。
+
+        判据用可用区（而不是屏几何）：换宿主之后这只就被那块屏的可用区钳着——
+        只有"已经整块落在那个域里"才能保证换帧不需要任何钳制。
+        """
+        for screen in QGuiApplication.screens():
+            try:
+                avail = QRectF(screen.availableGeometry())
+            except RuntimeError:
+                continue
+            if self._rect_covers(avail, body_global):
+                return screen
+        return None
+
+    def _keep_seam_domain(self, sprite) -> None:
+        """移交后按新的宿主重算开域矩形（局部坐标随宿主变，必须重算）。
+
+        重算等价于"只换坐标系"：新矩形集合在新局部坐标里同样包含身体位置，
+        故不需要任何钳制。
+        """
+        host = self._host_of(sprite)
+        if host is None:
+            return
+        rects = self._seam_domain_rects(host)
+        sprite.set_clamp_rects(rects or None)
+
+    @staticmethod
+    def _sprite_body_center_global(sprite, top_left_global) -> QPointF:
+        """sprite 身体框中心的全局坐标（``top_left_global`` = 它的全局左上角）。"""
+        rect = sprite.rect()
+        body = sprite.body_rect()
+        off_x = body.x() + body.width() / 2.0 - rect.x()
+        off_y = body.y() + body.height() / 2.0 - rect.y()
+        return QPointF(top_left_global.x() + off_x, top_left_global.y() + off_y)
+
+    def _desired_global_pos(self, sprite, cursor_global) -> QPointF | None:
+        """拖拽中光标位置 → 该 sprite 的全局左上角落点。
+
+        抓取偏移（``_drag_offset``）是"光标 - 落点"的差值，两个坐标系里逐位相同，
+        故换屏前后同一算式都成立——这一条正是"换屏不改手感"的支点。
+        """
+        offset = getattr(sprite, "_drag_offset", None)
+        if offset is None:
+            return None
+        return QPointF(cursor_global) - QPointF(offset)
+
+    def route_drag_to_screen(self, sprite, cursor_global=None) -> bool:
+        """跨屏路由（单只一次；公开接缝，逐 tick 由 :meth:`route_seam_after_advance` 调）。
+
+        判据取**这一拍的实际身体位置**（见 :meth:`_route_one_seam`）：弹簧档的实际
+        位移发生在 ``sprite.advance`` 里，按事件时刻的光标落点判会在身体真正过缝
+        之前提前换宿主——宠被换到一块身体还没进入的屏上、随后被那块屏的钳制拉过去，
+        这正是跨屏大跳的来源。
+
+        ``cursor_global`` 只为兼容既有调用点保留（本判据不再使用光标）。
+        """
+        return self._route_one_seam(sprite)
+
+    def move_sprite_to_screen(self, sprite, screen, global_pos=None) -> bool:
+        """把**这一只**宠放到指定屏（跨屏拖拽与显式调用共用；返回是否真的换了宿主）。
+
+        ``global_pos`` = 目标全局左上角；None = 保持当前全局位置只换坐标系。
+        只动这一只：别的宠、别的屏的状态一分不变；目标宿主里现成有这块屏自己的
+        行为/碰撞/物理世界，故不需要任何"重建世界"的步骤。
+
+        关闭跨屏时只有启动时那块屏有窗口，故搬到别的屏直接拒绝（不建窗、不动
+        这只）：这是**有意**改屏归属的唯一入口，拒绝在这里就是"跨不过去"。
+        """
+        if sprite is None or screen is None:
+            return False
+        if not self._cross_screen_allowed and screen is not self._main_host.screen:
+            return False
+        target = self.host_for_screen(screen)
+        if target is None:
+            target = self._create_host(screen)
+        source = self._host_of(sprite)
+        if source is None:
+            self._place_sprite_in_host(sprite, target, global_pos=global_pos)
+            self._remember_sprite_screen(sprite, screen)
+            return True
+        if source is target:
+            if global_pos is not None:
+                sprite.set_pos(QPointF(
+                    global_pos - target.overlay.geometry().topLeft()))
+            return False
+        self._transfer_sprite(sprite, source, target, global_pos=global_pos)
+        # 有意换屏 = 改这只的屏归属（唯一写 screen_name 的地方；机械搬迁不写）
+        self._remember_sprite_screen(sprite, screen)
+        # 拖拽把这块屏上最后一只带走时，源宿主就此空掉：等这次 grab 收尾再拆
+        # （正在按着的那只宠的宿主绝不能当场消失）
+        self._reap_empty_hosts()
+        return True
+
+    def _remember_sprite_screen(self, sprite, screen) -> None:
+        """记下这只宠的**屏幕归属**（有意换屏时唯一改 ``screen_name`` 的地方）。
+
+        归属只在用户把这只**有意**拖到另一块屏时更新；被临时摆在别的屏上的宠
+        （关闭跨屏、或原来那块屏临时不在线）比例照旧更新、归属不被机械动作改写，
+        于是"关掉跨屏/临时拔屏 → 再开回来"仍回到各自那块屏。
+
+        **不在这里写盘**：本方法跑在拖拽的 mouseMove 上，而单键几何写实测中位
+        3.4 ms（p95 4.2 ms；目录锁被别人占着时最长等 ``DEFAULT_TIMEOUT_S`` = 5 s）
+        ——GUI 线程不该为一次落盘停这么久。改把待写的屏名记在**这只自己身上**，
+        由下一次几何自存与比例（同一文件、同一把锁、同一次原子写）一起落盘；
+        记在 sprite 上（同 ``_profile_generation`` / ``home_screen`` 的存法）随
+        这只的生命周期一起消失，退出/关闭路径不需要额外清理。
+        """
+        if sprite is None:
+            return
+        sprite._pending_screen_assignment = _screen_name(screen)
+
+    def _transfer_sprite(self, sprite, source, target, global_pos=None) -> None:
+        """宿主移交本体：换坐标系 + 过继状态。
+
+        刻意**不做**的三件事（做了就是"退出这只宠"而不是"搬家"）：
+
+        - 不广播 sprite 移除（``_sprite_removed_listeners``：行为/探头/彩蛋状态
+          注销）——那只在 ``remove_sprite`` 里；
+        - 不释放 clip（``release_clip``）——换屏后动画必须接着播，不能重新解码；
+        - 不动媒体/共享服务（音效池、联动、托盘、素材库都不认识"屏"）。
+        """
+        old_origin = source.overlay.geometry().topLeft()
+        new_origin = target.overlay.geometry().topLeft()
+        delta = QPointF(new_origin - old_origin)
+        copy = self._snapshot_sprite_bubble(sprite)
+        if getattr(sprite, "dragging", False):
+            # 拖拽会话的绝对坐标样本整体换帧（抓取偏移是差值，刻意不动）
+            sprite.translate_frame(delta)
+        source.overlay.detach_sprite_for_transfer(sprite)
+        source.behavior.forget(sprite)  # 状态表过继：目标宿主下一 tick 重建
+        # 原子换帧：位置与域必须**同时**按同一个 delta 换算，中间不许出现任何单矩形
+        # 钳制（旧顺序 set_bounds(新矩形) → 用旧局部坐标补钳 → 再 set_pos 减 delta，
+        # 会在缝上连钳两次，这就是跨屏大跳的来源）。
+        seam = getattr(sprite, "_clamp_rects", None)
+        if seam:
+            sprite.set_clamp_rects(
+                tuple(rect.translated(-delta.x(), -delta.y()) for rect in seam))
+        else:
+            sprite.set_bounds(QRect(target.bounds))
+        sprite.home_screen = target.screen
+        target.overlay.add_sprite(sprite)  # 重挂脏/活力回调，按新屏 DPR 重建帧
+        if global_pos is None:
+            # 只换坐标系：old_origin + pos == new_origin + (pos - delta) 逐位成立
+            sprite.set_pos(sprite.pos - delta)
+        else:
+            sprite.set_pos(QPointF(global_pos - new_origin))
+        # 跟随器随窗口重建：关旧气泡会发 hidden 信号，收口期闸门必须先立
+        # （否则"这一只换屏了"会被当成"用户收起了提醒"，在同一条上重挂/推进队列）
+        self._alert_copy_teardown = True
+        try:
+            self._rebind_sprite_bubble(sprite, copy)
+        finally:
+            self._alert_copy_teardown = False
+        self._bind_position_listener(sprite)
+        if self._alert_current is not None:
+            # 承载宠换屏：按同 ID + 剩余 TTL 把那一份副本挂到新气泡上
+            # （旧副本对象已随旧窗口的跟随器关闭）
+            self._sync_alert_copy()
+
+    def _place_sprite_in_host(self, sprite, host, global_pos=None) -> None:
+        """把一只**还没落位**的 sprite 放进宿主（建库/复活期用）。
+
+        拖拽移交走 ``_transfer_sprite``（要过继拖拽会话状态），本方法只做落位。
+        """
+        sprite.home_screen = host.screen
+        sprite.set_bounds(QRect(host.bounds))
+        host.overlay.add_sprite(sprite)
+        if global_pos is not None:
+            sprite.set_pos(QPointF(
+                global_pos - host.overlay.geometry().topLeft()))
+
+    def _bind_position_listener(self, sprite) -> None:
+        """主 sprite 的 runtime 标记跟随监听（换宿主后重挂到**它自己那块屏**的窗）。
+
+        监听挂在**持有这只 sprite 的宿主窗**上（不是 ``self.overlay`` = 主宿主那张
+        窗）：主宠被拖到副屏后，主宿主那张窗不再驱动它，挂在那里等于永不触发
+        （runtime 标记停在旧位置），而且主宿主被回收时那条注册跟着窗口一起消失。
+        挂接前先摘掉其它宿主窗上的同名回调——换屏来回走时不留下影子注册。
+        """
+        if sprite is not self.sprite:
+            return
+        host = self._host_of(sprite) or self._main_host
+        for other in self._hosts:
+            if other is not host:
+                other.overlay.remove_position_listener(
+                    sprite, self._on_main_sprite_moved)
+        host.overlay.add_position_listener(sprite, self._on_main_sprite_moved)
+
+    def _reap_empty_hosts(self) -> None:
+        """拆掉空宿主：一块屏上的宠全走了，那张 overlay 不该留在桌面上。
+
+        两道闸（缺一不可）：
+
+        - **最后一张窗口留**：壳必须有一个可承载新宠/托盘入口的窗口（单屏用户下它
+          与进程同寿命）；
+        - **按着不放的宿主不拆**：有活跃 grab 的窗口一旦消失，这次输入会话就再也
+          收不了尾（直到看门狗下一次兜底）。grab 收尾会再调一次本方法。
+
+        主宿主（宿主表首位 = ``self.overlay`` 的来源）不是特权：它空了且还有别的
+        宿主时同样拆（拆后次位宿主顺位成主，`self.overlay` 仍指向"壳当前那张承载
+        窗"）——否则跨屏拖走主宠后，空屏上会常驻一张全屏透明窗（没有像素要上屏，
+        穿透轮询却照跑）。
+        """
+        for host in list(self._hosts):
+            if len(self._hosts) <= 1:
+                break
+            if host.overlay.sprites:
+                continue
+            if host.overlay._projections:  # noqa: SLF001 - 同模块协作面
+                continue  # 正在给缝那边画投影：过渡没完，窗不能拆
+            if getattr(host.overlay, "_mouse_grab", None) is not None:
+                continue
+            self._release_host(host)
+
+    def _release_host(self, host) -> None:
+        """拆一块空宿主：断屏信号、关窗、摘出宿主表。
+
+        关闭只影响本窗口：共享驱动器还在驱动其余宿主（``TickDriver.detach`` 只在
+        最后一个成员摘除时停表），共享服务（音效/联动/托盘/素材库）根本不知道
+        宿主的存在。拆掉的是主宿主时把锁屏通知注册改挂到新的主宿主句柄上
+        （旧 HWND 随关闭失效）。
+
+        幂等：拔屏处置（``handle_screen_removed``）与 grab 收尾的空宿主回收
+        （``_on_grab_finished`` → ``_reap_empty_hosts``）会先后各调一次——收尾
+        通知先把这块空宿主收掉，拔屏处置再调就是"已不在册"。返回（不重复关窗、
+        不重复摘表）而不是二次回收。
+        """
+        if len(self._hosts) <= 1:
+            return
+        if host not in self._hosts:
+            return
+        index = self._hosts.index(host)
+        self._disconnect_host_screen(host)
+        try:
+            host.overlay.close()
+        except RuntimeError:
+            pass  # 原生窗口已销毁（销毁路径没走 closeEvent）
+        if host in self._hosts:
+            self._hosts.remove(host)
+        host.extras = []
+        if index == 0:
+            self._register_session_notifications()
+
+    # ---------------------------------------------------------------- 屏事件
+    def _wire_screen_signals(self) -> None:
+        self.app.screenAdded.connect(self.handle_screen_added)
+        self.app.screenRemoved.connect(self.handle_screen_removed)
+        self.app.primaryScreenChanged.connect(self.handle_primary_screen_changed)
+
+    def _connect_host_screen(self, host) -> None:
+        """把该宿主所在屏的几何信号挂到它的几何同步上（逐屏各挂自己的）。
+
+        假屏（测试替身）没有 Qt 信号时静默跳过：几何同步由测试直调 handler。
+        """
+        screen = host.screen
+        slot = host._geometry_slot = (
+            lambda *args, _host=host: self._sync_host_geometry(_host))
+        try:
+            screen.geometryChanged.connect(slot)
+            screen.availableGeometryChanged.connect(slot)
+        except (AttributeError, TypeError):
+            pass
+
+    def _disconnect_host_screen(self, host) -> None:
+        slot = getattr(host, "_geometry_slot", None)
+        if slot is None:
+            return
+        host._geometry_slot = None
+        try:
+            host.screen.geometryChanged.disconnect(slot)
+            host.screen.availableGeometryChanged.disconnect(slot)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+
+    def handle_geometry_changed(self, *args) -> None:
+        """主宿主的几何变化（旧入口，测试直调）：几何同步 + DPR 重喂。"""
+        self._sync_host_geometry(self._main_host)
+
+    def handle_screen_added(self, screen) -> None:
+        """屏插入：不迁宠（位置记忆归各宠自己的 ``screen_name``，只在下次启动
+        或显式移交时生效）；本刀只观测记录。"""
+        logging.info("overlay: screen added (%s)", _screen_name(screen))
+
+    def handle_screen_removed(self, screen) -> None:
+        """屏拔出：**只**处置那块屏上的宠。
+
+        - 那块屏上的宠搬到仍在用的另一块屏（有的屏有宿主就直接并过去，家顺位搬到
+          它；没有别的宿主才把主宿主整体重建到兜底屏）——没有它就没有
+          ``self.overlay``；
+        - 与我们无关的屏：什么都不做（主屏切换另走 ``handle_primary_screen_changed``）。
+        """
+        logging.info("overlay: screen removed (%s)", _screen_name(screen))
+        host = self.host_for_screen(screen)
+        # 跨屏临时合法域里可能含这块已拔掉的屏：先全部收回（域是"当时那些相接屏"的
+        # 快照，屏没了还留着它就等于把宠放进一块不存在的屏）。下一次拖拽会重开。
+        for other in list(self._hosts):
+            for sprite in list(other.overlay.sprites):
+                if getattr(sprite, "_clamp_rects", None) is not None:
+                    sprite.set_clamp_rects(None)
+        if host is None:
+            return
+        self._end_drag(host)  # 拖拽中拔屏处置（v1.1 §10）
+        survivor = self._surviving_host(screen)
+        if survivor is not None:
+            self._absorb_host_sprites(host, survivor)
+            self._release_host(host)
+            return
+        self._migrate_to_screen(self._fallback_screen(screen))
+
+    def _surviving_host(self, removed):
+        """另一块屏上的宿主（没有 → None）。"""
+        for host in self._hosts:
+            if host.screen is not removed:
+                return host
+        return None
+
+    def handle_primary_screen_changed(self, screen) -> None:
+        """主屏变更：**不迁宠**（用户把哪块屏设成主屏是系统级操作，与桌宠落位无关；
+        宠的位置由各自的 ``screen_name`` 记忆与拖拽决定）。只记日志。"""
+        logging.info("overlay: primary screen changed -> %s", _screen_name(screen))
+
+    def _fallback_screen(self, removed):
+        """屏被拔除后的兜底屏：当前主屏；它也被拔了就取任一存活屏。"""
+        primary = QGuiApplication.primaryScreen()
+        if primary is not None and primary is not removed:
+            return primary
+        for screen in QGuiApplication.screens():
+            if screen is not removed:
+                return screen
+        return None
+
+    def _absorb_host_sprites(self, source, target) -> None:
+        """把 source 宿主上的**全部**宠搬到 target（源屏拔除的处置）。
+
+        落点保持"相对可用区的比例"（``_migrate_sprite_position`` 同一口径，比例在
+        源屏算、落点在目标屏钳）：不能先搬再按比例算——搬完位置已经是目标坐标系
+        的量，再拿源屏边界去算比例就是两个坐标系混算。
+        """
+        if source is None or target is None or source is target:
+            return
+        old_bounds = QRect(source.bounds)
+        new_bounds = QRect(target.bounds)
+        if old_bounds.width() <= 0 or old_bounds.height() <= 0:
+            return
+        for sprite in list(source.overlay.sprites):
+            rect = sprite.rect()
+            rx = (rect.x() + rect.width() / 2.0 - old_bounds.x()) / old_bounds.width()
+            ry = (rect.y() + rect.height() / 2.0 - old_bounds.y()) / old_bounds.height()
+            self._transfer_sprite(sprite, source, target)
+            sprite.set_pos(QPointF(
+                new_bounds.x() + rx * new_bounds.width() - rect.width() / 2.0,
+                new_bounds.y() + ry * new_bounds.height() - rect.height() / 2.0))
+
+    def _sync_geometry(self) -> None:
+        """主宿主几何同步（旧入口，测试直调）：见 ``_sync_host_geometry``。"""
+        self._sync_host_geometry(self._main_host)
+
+    def _sync_host_geometry(self, host) -> None:
+        """某块屏几何/可用区变化：窗口几何 + 该屏控制器边界 + 该屏全部 sprite
+        按比例迁移。
+
+        同屏的宠用**同一份** old/new bounds 迁移（G2：只迁一只会让别的留在旧绝对
+        坐标上，随后被新边界钳到同一条边，相对布局丢失）；换域只能整体排在循环
+        **之后**——它一次把该屏全部 sprite 的钳制域换成新边界，还没轮到的那几只
+        会被就地钳一次、旧位置比例当场抹掉。每只自己的换域与落点顺序在
+        ``_migrate_sprite_position`` 内（比例取旧边界，落点钳新边界）。
+
+        overlay 全局原点变化（屏位置变）另同步该屏气泡跟随器的原点（不重建跟随器
+        与气泡：重建会丢正在显示的气泡）与挂在它上面的岛墙原点。
+        """
+        if host is None:
+            return
+        old_bounds = QRect(host.bounds)
+        old_origin = host.overlay.geometry().topLeft()
+        host.overlay.setGeometry(host.screen.geometry())
+        new_bounds = self._local_bounds(host.screen)
+        sprites = list(host.overlay.sprites)
+        for sprite in sprites:
+            self._migrate_sprite_position(old_bounds, new_bounds, sprite)
+        host.set_bounds(new_bounds)
+        for sprite in sprites:
+            sprite.set_dpr(float(host.screen.devicePixelRatio()))
+        self._sync_bubble_origin(host, old_origin)
+        if host is self._main_host:
+            self._refresh_self_talk_image_cache_for_dpr()
+
+    def _sync_bubble_origin(self, host, old_origin: QPoint) -> None:
+        """某宿主 overlay 全局原点变化后同步"按全局原点取坐标"的消费方。
+
+        原点 = ``overlay.geometry().topLeft()``，两个消费方都把它缓存在别处：
+
+        - 该屏宠物的气泡跟随器（``SpriteBubbleFollower.__init__`` 缓存；
+          ``set_origin`` 会在原点真变时把在显气泡重定位一次——同尺寸平移屏下
+          sprite 局部位置不变、没有位移通知，不同步则气泡停在旧全局位置）；
+        - 岛墙桥（``IslandWindowBridge.set_origin``：更新原点 + 作废岛速基线 +
+          立刻按新原点重算并重登记局部几何，否则墙留在旧原点、碰撞位置整体偏移）
+          ——只在岛挂在本宿主上时。
+
+        仅原点真变时调用：任务栏等"只有 available 变化"的场景原点不变，两个消费
+        方都不产生任何多余动作；无跟随器/无桥（岛碰撞关、无岛）时整段跳过，
+        不凭空建桥、不重建气泡。
+        """
+        origin = host.overlay.geometry().topLeft()
+        if origin == old_origin:
+            return
+        for follower in self._host_bubble_followers(host):
+            try:
+                follower.set_origin(origin)
+            except Exception:
+                logging.debug("overlay: 气泡跟随原点同步失败", exc_info=True)
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None and getattr(self, "_island_host", None) is host:
+            try:
+                bridge.set_origin(origin)
+            except Exception:
+                logging.debug("overlay: 岛墙原点同步失败", exc_info=True)
+
+    def _host_bubble_followers(self, host) -> list:
+        """挂在该宿主上的气泡跟随器（主 + 逐只子宠）。"""
+        followers = []
+        for sprite, follower in self._all_bubble_followers():
+            if follower is None:
+                continue
+            if self._host_of(sprite) is host:
+                followers.append(follower)
+        return followers
+
+    def _all_bubble_followers(self) -> list:
+        """(sprite, follower) 全表（主宠 + 逐只子宠）。"""
+        items = [(self.sprite, getattr(self, "_bubble_follower", None))]
+        items.extend(self._bubble_followers.items())
+        return [(sprite, follower) for sprite, follower in items if sprite is not None]
+
+    def _apply_bounds(self, new_bounds: QRect) -> None:
+        """主宿主换可用区（旧入口，测试直调）：见 ``ScreenHost.set_bounds``。"""
+        host = self._main_host
+        if host is not None:
+            host.set_bounds(new_bounds)
+
+    def _migrate_sprite_position(self, old_bounds: QRect, new_bounds: QRect,
+                                 sprite=None) -> None:
+        """rx/ry 语义迁移：sprite 中心相对可用区的比例在几何变化前后不变
+        （口径同 window_placement.save_position 的持久化比例）。
+
+        两步各按自己那一侧的边界口径算，顺序不能合并：
+
+        - **取比例必须在换边界之前**——``PetSprite.set_bounds`` 会就地钳一次，
+          先换边界就把旧位置的比例钳没了（G2 已锁死的语义）；
+        - **写落点必须在换边界之后**——``set_pos`` 受当前边界钳制，落点在旧边界
+          下先被截断、随后 ``_apply_bounds`` 扩边界也不回位：小屏/低分迁到大屏/
+          高分时靠右/靠下的宠物整只卡在旧边缘（实测宽 1000→1600：比例落点
+          x≈1230 被旧边界钳成 744）。
+
+        只换本只的钳制域（本只以外的 sprite 各自的边界在轮到自己时才换，
+        比例取自它们各自的旧位置），``_apply_bounds`` 随后统一写一遍是同值幂等。
+        """
+        sprite = self.sprite if sprite is None else sprite
+        if sprite is None:
+            return
+        if old_bounds.width() <= 0 or old_bounds.height() <= 0:
+            return
+        rect = sprite.rect()
+        rx = (rect.x() + rect.width() / 2.0 - old_bounds.x()) / old_bounds.width()
+        ry = (rect.y() + rect.height() / 2.0 - old_bounds.y()) / old_bounds.height()
+        ncx = new_bounds.x() + rx * new_bounds.width()
+        ncy = new_bounds.y() + ry * new_bounds.height()
+        sprite.set_bounds(QRect(new_bounds))
+        sprite.set_pos(QPointF(ncx - rect.width() / 2.0, ncy - rect.height() / 2.0))
+
+    def _migrate_to_screen(self, new_screen) -> None:
+        """主宿主换屏（拔掉主屏/显式调用）：窗口重建，其上的宠按比例跟着走。
+
+        重建出的新 overlay 是**未显示**的新窗口：是否 show 回桌面、是否补放行
+        播放节拍、是否重挂气泡，全部按迁移前的有效可见性快照决定（见下
+        ``was_visible``）——隐藏中的窗口不因一次屏事件自己冒出来。
+
+        只动主宿主上的宠：其它屏的宿主与它们的窗口一分不变（多屏下"拔掉主屏"
+        不该把副屏上的宠一起搬回来）。
+        """
+        if new_screen is None or new_screen is self._screen:
+            return
+        host = self._main_host
+        old_bounds = QRect(host.bounds)
+        old_overlay = host.overlay
+        # 迁移前快照"有效可见性"（= 整窗可见 **且** 不在全屏避让隐藏态）。迁移
+        # 后是否 show / 补放行播放节拍只认它：隐藏中的窗口（托盘
+        # ``set_pet_visible(False)`` / 全屏避让 ``_auto_hidden``）不得因为一次屏
+        # 事件被重建路径无条件 show 回桌面。全屏避让按 watcher 口径——迁移本身
+        # 不重评全屏探测，故沿用当下的 ``_auto_hidden``（切走前它已把窗口 hide，
+        # 只是钉住"别顺手显示"这一方向；真解除仍由 watcher 的翻转回调走显示路径）。
+        was_visible = old_overlay.isVisible() and not self._auto_hidden
+        # 迁移前抓一份"正在显示的非粘滞气泡"文案：下面 ``_bind_bubble`` 会
+        # ``follower.close()`` 关掉旧气泡窗（旧版气泡是独立 Tool 窗，跨屏只跟随
+        # 不销毁），不抓就整条气泡在拔屏瞬间消失。
+        transient_bubble = self._snapshot_transient_bubble()
+        self._end_drag()
+        self._disconnect_host_screen(host)
+        new_bounds = self._local_bounds(new_screen)
+        host.screen = new_screen
+        host.overlay = ShellOverlayWindow(new_screen, driver=self.driver)
+        host.overlay.host = host
+        host.overlay.behavior = host.behavior
+        # 迁移后接线恢复（新旧 overlay 共用一份接线清单：``_wire_host_overlay``）
+        self._wire_host_overlay(host, host.overlay)
+        self._connect_host_screen(host)
+        # 本宿主的宠随窗一起迁（按比例；其余宿主不动）
+        for sprite in list(old_overlay.sprites):
+            old_overlay.detach_sprite_for_transfer(sprite)  # 迁移保留 clip
+            host.overlay.add_sprite(sprite)
+            sprite.home_screen = new_screen
+            self._migrate_sprite_position(old_bounds, new_bounds, sprite)
+            self._bind_position_listener(sprite)
+        host.set_bounds(new_bounds)
+        self._apply_window_capabilities()  # on_top/穿透复合/监视器门重挂
+        was_started = self._started
+        # M-2：驱动器为进程级共享（新 overlay 已在构造时挂上）——不再停旧表
+        # 再起新表（那会在多 overlay 下停掉整组 tick）；旧 overlay 关闭即摘除。
+        if host.feeding is not None:
+            self._bind_feeding(host)
+        if (getattr(self, "_bubble_follower", None) is not None
+                or getattr(self, "_bubble_followers", None)):
+            # 跟随器把旧 overlay 记进了自身（构造参数 + 位置监听者），迁移必须
+            # **全部**重建（B7b：主 + 每只子宠各一只）。判定含"只有子宠"的形态
+            # （slot0 已关闭）：只看主跟随器会把子宠气泡留在已关闭的旧 overlay 上
+            # ——不再跟随、提醒副本停在旧位置，且新的承载气泡永远建不出来。
+            self._rebuild_all_bubbles([host])
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None and getattr(self, "_island_host", None) is host:
+            # 屏迁移：岛墙局部坐标按新 overlay 原点重算（气泡跟随器同款）
+            bridge.set_origin(host.overlay.geometry().topLeft())
+        if was_started:
+            # 新 overlay 是新 HWND：锁屏通知注册改挂到它上面（旧句柄随关闭失效）。
+            # 注册按 HWND 走、与可见性无关，故不并进下面的可见分支：隐藏中迁移
+            # 不回这里重挂的话，锁屏消息仍发往已关闭的旧句柄（休眠/唤醒收不到）。
+            self._register_session_notifications()
+        if was_started and was_visible:
+            self.overlay.show()
+            self.overlay.start()
+            # 迁移前可见 = 该显示就显示：迁移重建不该把播放节拍留在暂停
+            # （隐藏期压住的暂停归真正的显示路径解除，可见态下必须补放行，
+            # 否则窗口可见而宠冻在首帧——与挂机冻结同貌）。
+            self._set_all_clips_paused(False)
+            # 迁移不丢气泡：新建的跟随器自带一只**空**气泡窗（未 show），
+            # 把原内容按同一口径重新挂上——粘滞提醒（含队列来源，pump_alerts
+            # 与 legacy sticky 都写 ``_sticky_*``）优先；非粘滞的限时气泡用
+            # 迁移前抓下的文案补一次（不可见壳不冒泡，故本分支只在迁移前
+            # 可见时进入，与 set_pet_visible(False) 同纪律）。
+            if self._alert_current is not None:
+                # 队列提醒：承载宠跨屏迁移（跟随器全部重建）后按同 ID + 剩余 TTL
+                # 重挂到承载宠的新气泡上（旧气泡对象已随旧 overlay 关闭）
+                self._sync_alert_copy()
+            else:
+                self._restore_sticky_bubble()
+            if transient_bubble is not None and self._alert_current is None:
+                text, subtitle, duration_ms = transient_bubble
+                self._show_bubble_text(text, duration_ms, subtitle=subtitle)
+        old_overlay.close()
+
+    def _rebuild_all_bubbles(self, hosts=None) -> None:
+        """重建气泡跟随器（缺省 = 全部；给 ``hosts`` 则只重建那些宿主上的宠）。
+
+        跟随器把旧 overlay 记进了自身（``_origin`` 与位置监听注册表），宿主换窗
+        后必须整套换新；子宠各自的气泡窗同样不能留在已关闭的旧 overlay 上。
+
+        承载气泡收口期同样先摘引用 + 关闸：重建就是"关掉旧的、建新的"，旧气泡的
+        hidden 信号不该触发一次重挂（重挂由迁移的恢复分支走承载宠漏斗）。
+        """
+        sprites = None
+        if hosts is not None:
+            sprites = [sprite for host in hosts for sprite in host.overlay.sprites]
+        self._alert_copy_teardown = True
+        self._alert_detach_copy()
+        try:
+            if sprites is None:
+                for follower in list(self._bubble_followers.values()):
+                    try:
+                        follower.close()
+                    except Exception:
+                        logging.debug("overlay: 迁移时子宠气泡收尾失败", exc_info=True)
+                self._bubble_followers = {}
+                self._bind_bubble()
+            else:
+                for sprite in sprites:
+                    if sprite is self.sprite:
+                        follower = getattr(self, "_bubble_follower", None)
+                        if follower is not None:
+                            follower.close()
+                            self._bubble_follower = None
+                    else:
+                        self._close_sprite_bubble(sprite)
+                for sprite in sprites:
+                    if sprite is self.sprite:
+                        self._bubble_follower = self._make_bubble_follower(sprite)
+                        self._bind_main_bubble_signals()
+                    else:
+                        self._ensure_sprite_bubble(sprite)
+        finally:
+            self._alert_copy_teardown = False
+
+    def _snapshot_transient_bubble(self):
+        """抓一份"正在显示的非粘滞气泡"（跨屏重建跟随器前调用）。
+
+        旧版气泡是独立 Tool 窗、跨屏只跟随不销毁；新版 ``_bind_bubble`` 会
+        ``follower.close()`` 关掉旧窗，故先取文案再重建后补显。取源是当前气泡
+        控件（自言自语/联动/识屏），控件不暴露停留时长，补显用壳的默认时长。
+        拿不到（无气泡/隐态/粘滞气泡/**队列提醒在屏**）返回 None——粘滞的走
+        ``_restore_sticky_bubble``；队列提醒走承载宠漏斗 ``_sync_alert_copy``
+        （同 ID + 剩余 TTL），这里再抓一份就会在目标那边多挂一条。
+        """
+        if self._sticky_bubble_active:
+            return None
+        if self._alert_current is not None:
+            # 队列提醒自有一条迁移路径（承载宠漏斗按同 ID + 剩余 TTL 重挂）：
+            # 这里再抓一份就会在"当前目标"上多挂一条（双副本）
+            return None
+        copy = self._bubble_copy(self._speech_bubble)
+        if copy is None:
+            return None
+        return copy[0], copy[1], 3200
+
+    def _snapshot_sprite_bubble(self, sprite):
+        """抓该 sprite 气泡上正在显示的文案（**换宿主**重建跟随器前调用）。
+
+        与 ``_snapshot_transient_bubble`` 的分工：那是整窗迁移时对"当前呈现面"
+        的抓取（含粘滞/提醒的专门通道），这里是某一只宠跨屏移交时对它自己那只
+        气泡的抓取——移交只影响这一只。
+
+        承载着粘滞/队列提醒的那只气泡不在这里抓：粘滞走 ``_restore_sticky_bubble``、
+        队列提醒走 ``_sync_alert_copy``（同 ID + 剩余 TTL），再抓一份就是双副本。
+        """
+        follower = self._bubble_for(sprite)
+        if follower is None:
+            return None
+        if (self._alert_presenter is sprite and self._alert_current is not None):
+            return None
+        if self._sticky_bubble_active and self._bubble_for(self.sprite) is follower:
+            return None
+        return self._bubble_copy(getattr(follower, "bubble", None))
+
+    @staticmethod
+    def _bubble_copy(bubble):
+        """气泡控件上正在显示的 (text, subtitle)；不可用返回 None。"""
+        if bubble is None:
+            return None
+        try:
+            if not bubble.isVisible():
+                return None
+        except Exception:
+            return None
+        text = str(getattr(bubble, "_raw_text", "") or "")
+        if not text:
+            return None
+        subtitle = ""
+        label = getattr(bubble, "_subtitle_label", None)
+        if label is not None:
+            try:
+                subtitle = str(label.text() or "")
+            except Exception:
+                subtitle = ""
+        return text, subtitle
+
+    def _rebind_sprite_bubble(self, sprite, copy=None) -> None:
+        """换宿主后重建该 sprite 的气泡跟随器（跟随器与气泡窗都绑在旧窗上）。
+
+        跟随器把窗口记进了自身（``_origin`` + 位置监听注册表），换窗必须换跟随器；
+        重建会关掉在显气泡窗，故用 ``copy`` 把文案按同一口径补挂回去。
+        不在册的 sprite（无跟随器/已退出）只补位置监听，不凭空造气泡。
+        """
+        if sprite is self.sprite:
+            follower = getattr(self, "_bubble_follower", None)
+            if follower is not None:
+                follower.close()
+            self._bubble_follower = self._make_bubble_follower(sprite)
+            self._bind_main_bubble_signals()
+        elif sprite in self._bubble_followers:
+            self._close_sprite_bubble(sprite)
+            self._ensure_sprite_bubble(sprite)
+        else:
+            return
+        if copy is not None:
+            self._show_bubble_text_for(sprite, copy[0], 3200, subtitle=copy[1])
+
+    def _end_drag(self, host=None) -> None:
+        """拖拽中拔屏/迁移：按当前位置松手收尾，清掉该窗口的 grab 状态。
+
+        ``host=None`` = 主宿主（旧入口）。多屏下每块屏的窗口各有自己的 grab，
+        拔掉哪块屏就收哪块屏的会话——**只**收那一块：别的窗口上的在途 grab
+        一个字段都不动。
+
+        收尾一律走窗口既有的 ``_finish_grab`` 协议，本方法只提供"按当前位置
+        松手"的位置这一个输入。自己清字段（旧实现）漏掉三件事：click-only /
+        拖拽提交旗标留在窗上、穿透轮询的拖拽降频（``set_drag_active``）没复位、
+        壳层的收尾通知收不到事件——最后一笔最致命，壳层被 grab 闸住的穿透收敛
+        （``_converge_pending``）就此永久滞留，而这条路径在
+        ``_migrate_to_screen(None)`` 提前返回时连随后的 show() 收敛都没有。
+        """
+        overlay = host.overlay if host is not None else self.overlay
+        grab = getattr(overlay, "_mouse_grab", None)
+        if grab is None:
+            return
+        try:
+            overlay._finish_grab(QPointF(grab.pos))
+        except Exception:
+            logging.exception("overlay: 屏事件收尾拖拽失败")
+
+    # ---------------------------------------------------------------- 会话/电源（O4）
+    def _install_session_watcher(self) -> None:
+        try:
+            self._session_watcher = install_session_watcher(
+                app=self.app, on_session_end=self._on_session_end,
+                on_suspend_change=self._on_suspend_changed)
+        except Exception:
+            logging.exception("overlay: 安装会话结束探测器失败")
+            self._session_watcher = None
+        self._register_session_notifications()
+        driver = getattr(self, "driver", None)
+        if driver is not None:
+            # 用户输入自愈挂起时走完整解除路径（含预热续跑），不只降档复位
+            driver.on_user_resume = lambda: self._on_suspend_changed(False, "user-input")
+
+    def _register_session_notifications(self, host=None) -> None:
+        """对宿主窗口句柄注册锁屏通知（Windows；失败降级为不支持并记日志）。
+
+        锁屏消息（WM_WTSSESSION_CHANGE）只发给注册过的窗口，注册必须落在真实
+        HWND 上（``winId()`` 会按需创建原生窗口）。失败不影响挂起/恢复探测
+        （WM_POWERBROADCAST 是广播）与关机探测（原生事件过滤器照旧）。
+
+        ``host=None`` = 主宿主（旧入口）。副屏窗口不重复注册：会话通知是进程级
+        的，主宿主那一份够用（``set_on_top`` 重建任一原生窗口后按该宿主补注册）。
+        """
+        watcher = getattr(self, "_session_watcher", None)
+        register = getattr(watcher, "register_session_notifications", None)
+        if not callable(register):
+            return
+        owner = host if host is not None else self._main_host
+        window = getattr(owner, "overlay", None)
+        if window is None:
+            return
+        try:
+            register(int(window.winId()))
+        except Exception:
+            logging.debug("overlay: 注册锁屏通知失败", exc_info=True)
+
+    def _on_suspend_changed(self, active: bool, reason: str = "") -> None:
+        """锁屏/挂起状态变化（会话/电源事件接线，O4）。
+
+        只降档：``driver.set_suspended`` 强制/解除 T3（True 时逐 sprite
+        ``pause_clip``，False 时续播 + 同帧回全速），**不**隐藏 overlay、**不**动
+        全屏/光标 watcher——唤醒后可见性与交互面必须原样。预热同拍成对停/续
+        （锁屏期间预热的 ffmpeg 没有可见收益；解锁必须补回，否则切动画退化到
+        冷首帧）。异常一律吞掉：事件过滤器在原生消息链上，绝不因桌宠内部错误
+        打断 Qt 事件循环。
+        """
+        logging.info("overlay: 锁屏/挂起状态变化 active=%s reason=%s", active, reason)
+        try:
+            driver = getattr(self, "driver", None)
+            if driver is not None:
+                driver.set_suspended(bool(active))
+        except Exception:
+            logging.exception("overlay: 锁屏/挂起降档失败")
+        try:
+            if active:
+                self._pause_warm_all()
+            else:
+                self._resume_warm_all()
+        except Exception:
+            logging.debug("overlay: 锁屏/挂起预热成对切换失败", exc_info=True)
+
+    def _on_session_end(self) -> None:
+        """会话结束（关机/注销）：停止本路径全部 ffmpeg reader。
+
+        spawn 闸门由 SessionWatcher 自身置位（先闸门后回调，顺序不可颠倒）；
+        这里只做 watcher 不管的部分：停全部 clip + 停 tick。幂等。"""
+        if self._session_end_done:
+            return
+        self._session_end_done = True
+        libs = [self.lib] + [lib for lib in getattr(self, "_spawned_libs", {}).values()]
+        for lib in libs:  # 每只子肥鱼各持独立库（M8）：关机窗口一并停 reader
+            stop_all = getattr(lib, "stop_all_clips", None)
+            if callable(stop_all):
+                try:
+                    stop_all()
+                except Exception:
+                    logging.exception("overlay: 会话结束停止素材库 clip 失败")
+        self._stop_all_hosts()
