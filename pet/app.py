@@ -3069,7 +3069,7 @@ class AppShell:
     def _sync_dynamic_island(self) -> None:
         """按配置创建/隐藏灵动岛；桌宠隐藏后灵动岛仍可常驻。"""
         island_cfg = self.config.get("dynamic_island", {})
-        enabled = bool(island_cfg.get("enabled", True)) if isinstance(island_cfg, dict) else False
+        enabled = bool(island_cfg.get("enabled", False)) if isinstance(island_cfg, dict) else False
         if not enabled:
             if getattr(self, "island", None) is not None:
                 self.island.hide()
@@ -4519,7 +4519,7 @@ class AppShell:
 
         island_action = add_tray_toggle(
             menu, '灵动岛',
-            bool(self.config.get("dynamic_island", {}).get("enabled", True)),
+            bool(self.config.get("dynamic_island", {}).get("enabled", False)),
             toggle_island)
 
         if self.enable_chat:
